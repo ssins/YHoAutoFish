@@ -1,4 +1,3 @@
-import ctypes
 import time
 import keyboard
 import pydirectinput  # 引入更成熟的底层模拟库
@@ -8,40 +7,42 @@ class Controller:
     
     def __init__(self):
         self.pressed_keys = set()
-        # pydirectinput 默认会有 0.01 秒的延迟，这是为了防屏蔽设计的
-        pydirectinput.PAUSE = 0.01
+        # 【极度关键】：pydirectinput 默认每次操作后会强制 sleep 0.01 秒
+        # 这是导致整个主循环变慢、程序“慢半拍”的罪魁祸首！必须设为 0
+        pydirectinput.PAUSE = 0.0
 
     def key_down(self, key_char):
-        """按下按键"""
-        key_char = key_char.lower()
+        """按下并保持某键"""
         try:
-            pydirectinput.keyDown(key_char)
-            self.pressed_keys.add(key_char)
-        except Exception:
-            pass
+            key = key_char.lower()
+            if key not in self.pressed_keys:
+                # 使用最底层的 ctypes 直连，绕过 pydirectinput 内部的封装逻辑
+                pydirectinput.keyDown(key)
+                self.pressed_keys.add(key)
+        except Exception as e:
+            print(f"[Controller] KeyDown error: {e}")
 
     def key_up(self, key_char):
-        """释放按键"""
-        key_char = key_char.lower()
+        """释放某键"""
         try:
-            pydirectinput.keyUp(key_char)
-            if key_char in self.pressed_keys:
-                self.pressed_keys.remove(key_char)
-        except Exception:
-            pass
+            key = key_char.lower()
+            if key in self.pressed_keys:
+                pydirectinput.keyUp(key)
+                self.pressed_keys.remove(key)
+        except Exception as e:
+            print(f"[Controller] KeyUp error: {e}")
 
-    def key_tap(self, key_char, duration=0.15):
+    def key_tap(self, key_char, duration=0.01):
         """
-        短按某键。
-        注意：对于《异环》这种基于虚幻引擎的游戏，点按时间必须足够长 (建议 0.15 秒以上)
-        否则会被游戏底层的按键防抖逻辑过滤掉。
+        短促点击某键
+        注意：这会造成当前线程阻塞 duration 秒。
+        但在微操时，我们已经将 duration 压到了极限，且 PAUSE 已经是 0。
         """
-        key_char = key_char.lower()
         try:
-            # 记录详细日志由上层完成，这里只做纯净的底层调用
-            pydirectinput.keyDown(key_char)
-            time.sleep(duration)
-            pydirectinput.keyUp(key_char)
+            self.key_down(key_char)
+            if duration > 0:
+                time.sleep(duration)
+            self.key_up(key_char)
         except Exception:
             pass
         
@@ -49,16 +50,6 @@ class Controller:
         """释放所有记录在案的被按下的键 (安全保护)"""
         for key in list(self.pressed_keys):
             self.key_up(key)
-
-    def mouse_click(self, x=None, y=None):
-        """模拟鼠标左键点击，用于结算界面点击关闭"""
-        try:
-            if x is not None and y is not None:
-                pydirectinput.click(x, y)
-            else:
-                pydirectinput.click()
-        except Exception:
-            pass
 
     def check_hotkey(self, hotkey_str):
         """检测快捷键是否按下，如 'f9'"""

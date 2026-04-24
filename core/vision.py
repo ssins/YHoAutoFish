@@ -15,25 +15,47 @@ class VisionCore:
             self.hsv_config[color_name]["min"] = min_val
             self.hsv_config[color_name]["max"] = max_val
 
-    def find_template(self, screen_img, template_path, threshold=0.70):
+    def find_template(self, screen_img, template_path, threshold=0.75, use_edge=False, use_binary=False):
         """
-        在截图中寻找模板图像 (带有自动灰度化处理与多尺度缩放)
-        screen_img: BGR numpy array
-        template_path: 模板图片路径 (支持中文路径)
-        threshold: 匹配置信度阈值，稍微调低以应对游戏内背景干扰
+        在屏幕截图中寻找模板图片 (支持中文路径)
+        use_edge: 是否使用 Canny 边缘检测匹配（排除光照干扰）
+        use_binary: 是否使用二值化提取高亮特征匹配（适用于白天水面强光下的纯白 UI 图标）
+        返回 (x, y) 坐标，如果没有找到返回 (None, None)
         """
         try:
-            # 解决 cv2.imread 无法读取包含中文路径的问题
-            template_data = np.fromfile(template_path, dtype=np.uint8)
-            template = cv2.imdecode(template_data, cv2.IMREAD_COLOR)
+            # 避免使用 cv2.imread 读取中文路径报错，使用 numpy fromfile
+            template = cv2.imdecode(np.fromfile(template_path, dtype=np.uint8), -1)
             
             if template is None:
                 print(f"[Vision] 无法解析图片数据: {template_path}")
                 return None, 0.0
-                
-            # 转换为灰度图进行匹配，减少颜色和半透明带来的干扰
+
+            # 统一转为灰度图
             screen_gray = cv2.cvtColor(screen_img, cv2.COLOR_BGR2GRAY)
-            template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            
+            # 如果模板有 alpha 通道（透明背景），我们可以提取它的 mask，但通常为了简单直接用灰度
+            if len(template.shape) == 3 and template.shape[2] == 4:
+                # 把透明背景变成黑色
+                alpha_channel = template[:, :, 3]
+                rgb_channels = template[:, :, :3]
+                # 创建一个白色或黑色背景
+                background = np.zeros_like(rgb_channels, dtype=np.uint8)
+                alpha_factor = alpha_channel[:, :, np.newaxis] / 255.0
+                template_bgr = (rgb_channels * alpha_factor + background * (1 - alpha_factor)).astype(np.uint8)
+                template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
+            else:
+                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+
+            # 强力防干扰：二值化处理
+            # 只提取图像中最亮的部分（纯白色的字母和边框），把所有灰色、蓝色的水面全部变成纯黑
+            if use_binary:
+                # 像素值大于 200 的变成 255（纯白），其他的变成 0（纯黑）
+                _, screen_gray = cv2.threshold(screen_gray, 200, 255, cv2.THRESH_BINARY)
+                _, template_gray = cv2.threshold(template_gray, 200, 255, cv2.THRESH_BINARY)
+
+            if use_edge and not use_binary:
+                screen_gray = cv2.Canny(screen_gray, 50, 150)
+                template_gray = cv2.Canny(template_gray, 50, 150)
             
             best_match = None
             best_val = -1

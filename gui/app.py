@@ -29,8 +29,10 @@ class App(ctk.CTk):
         self.config = {
             "hotkey_start": "ctrl+f9",
             "hotkey_stop": "ctrl+f10",
-            "hold_threshold": 15,
-            "deadzone_threshold": 5
+            "hold_threshold": 25,
+            "deadzone_threshold": 10,
+            "fishing_timeout": 180,
+            "debug_mode": False
         }
         self.load_config()
         
@@ -106,21 +108,37 @@ class App(ctk.CTk):
         self.btn_record_stop.grid(row=1, column=1, padx=10, pady=15, sticky="ew")
 
         # 控制阈值区
-        self.lbl_hold = ctk.CTkLabel(self.tabview.tab("高级设置"), text="长按死区阈值 (Hold):")
-        self.lbl_hold.grid(row=2, column=0, padx=10, pady=15, sticky="w")
-        self.slider_hold = ctk.CTkSlider(self.tabview.tab("高级设置"), from_=5, to=50, number_of_steps=45)
-        self.slider_hold.grid(row=2, column=1, padx=10, pady=15, sticky="ew")
-        self.slider_hold.set(self.config["hold_threshold"])
+        self.lbl_hold = ctk.CTkLabel(self.tabview.tab("高级设置"), text="长按追赶阈值 (Hold):")
+        self.lbl_hold.grid(row=2, column=0, padx=10, pady=10, sticky="w")
+        
+        self.slider_hold = ctk.CTkSlider(self.tabview.tab("高级设置"), from_=10, to=50, number_of_steps=40, command=self._update_hold_label)
+        self.slider_hold.grid(row=2, column=1, padx=10, pady=10, sticky="ew")
+        self.slider_hold.set(self.config.get("hold_threshold", 25))
+        
+        self.lbl_hold_val = ctk.CTkLabel(self.tabview.tab("高级设置"), text=f"{int(self.slider_hold.get())}")
+        self.lbl_hold_val.grid(row=2, column=2, padx=10, pady=10, sticky="w")
 
-        self.lbl_deadzone = ctk.CTkLabel(self.tabview.tab("高级设置"), text="中心死区阈值 (Deadzone):")
-        self.lbl_deadzone.grid(row=3, column=0, padx=10, pady=15, sticky="w")
-        self.slider_deadzone = ctk.CTkSlider(self.tabview.tab("高级设置"), from_=0, to=20, number_of_steps=20)
-        self.slider_deadzone.grid(row=3, column=1, padx=10, pady=15, sticky="ew")
-        self.slider_deadzone.set(self.config["deadzone_threshold"])
+        self.lbl_timeout = ctk.CTkLabel(self.tabview.tab("高级设置"), text="防卡死超时(秒):")
+        self.lbl_timeout.grid(row=3, column=0, padx=10, pady=10, sticky="w")
+        
+        self.slider_timeout = ctk.CTkSlider(self.tabview.tab("高级设置"), from_=60, to=300, number_of_steps=240, command=self._update_timeout_label)
+        self.slider_timeout.grid(row=3, column=1, padx=10, pady=10, sticky="ew")
+        self.slider_timeout.set(self.config.get("fishing_timeout", 180))
+        
+        self.lbl_timeout_val = ctk.CTkLabel(self.tabview.tab("高级设置"), text=f"{int(self.slider_timeout.get())}")
+        self.lbl_timeout_val.grid(row=3, column=2, padx=10, pady=10, sticky="w")
+        
+        # Debug 开关
+        self.switch_debug = ctk.CTkSwitch(self.tabview.tab("高级设置"), text="开启 Debug 视觉窗口 (诊断用)")
+        self.switch_debug.grid(row=4, column=0, columnspan=2, padx=10, pady=15, sticky="w")
+        if self.config.get("debug_mode", False):
+            self.switch_debug.select()
+        else:
+            self.switch_debug.deselect()
         
         # 保存设置按钮
         self.btn_save_config = ctk.CTkButton(self.tabview.tab("高级设置"), text="应用并保存设置", command=self.save_and_apply_config)
-        self.btn_save_config.grid(row=4, column=0, columnspan=2, padx=10, pady=30, sticky="ew")
+        self.btn_save_config.grid(row=5, column=0, columnspan=2, padx=10, pady=30, sticky="ew")
 
         # 启动定时更新 UI 的循环
         self.after(100, self.process_queue)
@@ -146,8 +164,9 @@ class App(ctk.CTk):
             
         self.config["hotkey_start"] = self.btn_record_start.cget("text")
         self.config["hotkey_stop"] = self.btn_record_stop.cget("text")
-        self.config["hold_threshold"] = self.slider_hold.get()
-        self.config["deadzone_threshold"] = self.slider_deadzone.get()
+        self.config["hold_threshold"] = int(self.slider_hold.get())
+        self.config["fishing_timeout"] = int(self.slider_timeout.get())
+        self.config["debug_mode"] = bool(self.switch_debug.get())
         
         # 更新左侧面板的主按钮文本
         self.btn_start.configure(text=f"启动 ({self.config['hotkey_start']})")
@@ -164,6 +183,16 @@ class App(ctk.CTk):
             self.tabview.set("主控面板") # 保存后自动切回主页
         except Exception as e:
             self.write_log(f"配置保存失败: {e}")
+
+    def _update_hold_label(self, value):
+        """实时更新 Hold 阈值显示"""
+        if hasattr(self, 'lbl_hold_val'):
+            self.lbl_hold_val.configure(text=f"{int(value)}")
+
+    def _update_timeout_label(self, value):
+        """实时更新防卡死超时显示"""
+        if hasattr(self, 'lbl_timeout_val'):
+            self.lbl_timeout_val.configure(text=f"{int(value)}")
 
     def open_github(self):
         webbrowser.open("https://github.com/FADEDTUMI")
@@ -305,8 +334,9 @@ class App(ctk.CTk):
         if self.sm.is_running: return
         
         # 从配置中拿最新的参数同步给后台
-        self.sm.update_config("t_hold", self.config["hold_threshold"])
-        self.sm.update_config("t_deadzone", self.config["deadzone_threshold"])
+        self.sm.update_config("t_hold", self.config.get("hold_threshold", 25))
+        self.sm.update_config("fishing_timeout", self.config.get("fishing_timeout", 180))
+        self.sm.update_config("debug_mode", self.config.get("debug_mode", False))
         
         # 禁用设置组件 (防误触)
         self.btn_save_config.configure(state="disabled")

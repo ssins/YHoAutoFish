@@ -1,0 +1,6 @@
+{
+    "hotkey_start": "alt+9",
+    "hotkey_stop": "alt+0",
+    "hold_threshold": 15.0,
+    "deadzone_threshold": 5.0
+}
