@@ -5,3 +5,6 @@ customtkinter>=5.2.0
 pywin32>=306
 pydirectinput>=1.0.4
 keyboard>=0.13.5
+cnocr>=2.3.0
+matplotlib>=3.7.0
+pillow>=10.0.0

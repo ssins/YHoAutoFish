@@ -1,24 +1,21 @@
 import sys
 import os
 
-# 确保能找到 core 和 gui 模块
+# Ensure modules can be found
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from gui.app import App
+from PySide6.QtWidgets import QApplication
+from gui.app import AppWindow
 
 if __name__ == '__main__':
-    # 初始化GUI应用
-    app = App()
+    print("Starting app...", flush=True)
+    app = QApplication(sys.argv)
     
-    # 进入主事件循环
-    try:
-        app.mainloop()
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print(f"致命错误: {e}")
-    finally:
-        # 清理资源
-        if hasattr(app, 'sm'):
-            app.sm.stop()
-        os._exit(0)
+    app.setApplicationName("FishingBot")
+    
+    print("Creating AppWindow...", flush=True)
+    window = AppWindow()
+    print("Showing AppWindow...", flush=True)
+    window.show()
+    
+    sys.exit(app.exec())

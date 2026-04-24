@@ -3,12 +3,20 @@ import threading
 import queue
 import cv2
 import os
+import re
 
 from core.window_manager import WindowManager
 from core.screen_capture import ScreenCapture
 from core.controller import Controller
 from core.vision import VisionCore
 from core.pid import PIDController
+from core.record_manager import RecordManager
+
+# try:
+#     from cnocr import CnOcr
+# except ImportError:
+#     CnOcr = None
+CnOcr = None
 
 class StateMachine:
     STATE_IDLE = 0
@@ -23,11 +31,11 @@ class StateMachine:
         self.debug_queue = debug_queue
         
         self.wm = WindowManager()
-        # 将 ScreenCapture 的实例化推迟到 _run_loop 内部（即新线程内部），
-        # 避免在主线程中创建 mss 实例却在子线程中调用/销毁，导致跨线程 GDI 句柄异常。
         self.sc = None 
         self.ctrl = Controller()
         self.vis = VisionCore()
+        self.record_mgr = RecordManager()
+        self.ocr = None
         
         self.is_running = False
         self.current_state = self.STATE_IDLE
@@ -71,14 +79,23 @@ class StateMachine:
     def stop(self):
         """停止状态机"""
         if not self.is_running: return
+        self._log("[系统] 收到停止指令。")
         self.is_running = False
+        
+        # 记录本次运行时长
+        if self.start_timestamp > 0:
+            duration = int(time.time() - self.start_timestamp)
+            self.total_runtime += duration
+            self.record_mgr.add_runtime(duration)
+            
         self.ctrl.release_all()
         # 释放系统绘图句柄，防止二次启动时抛出 BitBlt 和 SelectObject 异常
         if hasattr(self, 'sc') and self.sc:
             self.sc.close()
         self._log("钓鱼脚本已停止。")
-        # 传递特定的控制指令给 GUI，让 GUI 恢复按钮状态
-        self._log("CMD_STOP_UPDATE_GUI")
+        # 通知 UI 更新
+        if self.log_queue:
+            self.log_queue.put("CMD_STOP_UPDATE_GUI")
 
     def update_config(self, key, value):
         self.config[key] = value
@@ -362,8 +379,40 @@ class StateMachine:
                 
                 # 如果底部有大量高亮文字，说明真的是成功结算界面了
                 if white_pixels > 150:
-                    self._log("[结算] 识别到结算文字特征，判定为钓鱼成功！")
-                    self._log(f"[结算] 尝试 ESC 关闭结算界面 (尝试 {attempt+1}/{max_attempts})...")
+                    self._log("[结算] 识别到结算文字特征，判定为钓鱼成功！正在识别鱼类信息...")
+                    
+                    fish_name = "未知鱼类"
+                    weight_g = 0
+                    
+                    if CnOcr is not None:
+                        if self.ocr is None:
+                            self._log("[系统] 正在初始化 OCR 模块...")
+                            self.ocr = CnOcr()
+                        
+                        # ROI for name: X: 40%-64%, Y: 15.5%-27%
+                        roi_name = (0.40, 0.155, 0.24, 0.115)
+                        name_img = self.sc.capture_relative(rect, *roi_name)
+                        
+                        # ROI for weight: X: 40%-60%, Y: 63%-74%
+                        roi_weight = (0.40, 0.63, 0.20, 0.11)
+                        weight_img = self.sc.capture_relative(rect, *roi_weight)
+                        
+                        if name_img is not None:
+                            res_name = self.ocr.ocr(name_img)
+                            if res_name:
+                                fish_name = res_name[0]['text'].strip()
+                                
+                        if weight_img is not None:
+                            res_weight = self.ocr.ocr(weight_img)
+                            if res_weight:
+                                weight_str = res_weight[0]['text'].strip()
+                                match = re.search(r'(\d+)', weight_str)
+                                if match:
+                                    weight_g = int(match.group(1))
+                                    
+                    self.record_mgr.add_catch(fish_name, weight_g)
+                    
+                    self._log(f"[结算] 捕获: {fish_name}, 重量: {weight_g}g。尝试 ESC 关闭结算界面 (尝试 {attempt+1}/{max_attempts})...")
                     
                     # 仅使用 ESC 关闭
                     self.ctrl.key_tap('esc', duration=0.15)
