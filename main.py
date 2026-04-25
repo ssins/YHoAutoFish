@@ -5,6 +5,8 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
+from core.paths import resource_path
 from gui.app import AppWindow
 
 if __name__ == '__main__':
@@ -12,6 +14,7 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     
     app.setApplicationName("FishingBot")
+    app.setWindowIcon(QIcon(resource_path("logo.jpg")))
     
     print("Creating AppWindow...", flush=True)
     window = AppWindow()

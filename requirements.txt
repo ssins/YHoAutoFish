@@ -1,6 +1,7 @@
 opencv-python>=4.8.0
 numpy>=1.24.0
 mss>=9.0.1
+PySide6>=6.10.0
 customtkinter>=5.2.0
 pywin32>=306
 pydirectinput>=1.0.4

@@ -13,6 +13,7 @@ from core.controller import Controller
 from core.vision import VisionCore
 from core.pid import PIDController
 from core.record_manager import RecordManager
+from core.paths import resource_path
 
 CnOcr = None
 
@@ -888,7 +889,7 @@ class StateMachine:
         # 在待机状态下，利用 use_binary=True 强力二值化特征提取。
         # 它可以无视白天水面的高亮背景，只对比纯白色图标本身，使得匹配成功率大幅提升。
         # 此时阈值可以安全地设在 0.65 甚至更高，彻底防止将背景噪点当成 F 键。
-        btn_path = os.path.join("assets", "F键图标.png")
+        btn_path = resource_path("assets", "F键图标.png")
         loc, conf = self.vis.find_template(btn_img, btn_path, threshold=0.60, use_edge=False, use_binary=True)
         
         if loc:
@@ -915,7 +916,7 @@ class StateMachine:
         # 每次重新抛竿后，重置 PID 控制器状态
         self.pid.reset()
         
-        text_path = os.path.join("assets", "上钩文字.png")
+        text_path = resource_path("assets", "上钩文字.png")
         loc, conf = self.vis.find_template(text_img, text_path, threshold=0.7)
         
         if loc:
@@ -1056,7 +1057,7 @@ class StateMachine:
         roi_failed_text = (0.2, 0.45, 0.6, 0.1)
         
         max_attempts = 10 # 增加循环次数，但缩短每次的等待时间，实现更敏捷的响应
-        failed_path = os.path.join("assets", "鱼儿溜走了.png")
+        failed_path = resource_path("assets", "鱼儿溜走了.png")
         
         # 成功结算界面的最底部，有一行非常清晰的白色文字：“点击空白区域关闭”
         # 我们截取屏幕底部的这块区域，通过分析其亮度（是否存在大量白色像素）来判断是否处于成功界面

@@ -9,6 +9,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 
+from core.paths import ensure_writable_file, resource_path
+
 _RECORD_FILE_LOCK = threading.RLock()
 OCR_CONFUSABLE_CHARS = str.maketrans({
     "賽": "紫",
@@ -34,9 +36,9 @@ class RecordManager:
         "consecutive_empty": 0,
     }
 
-    def __init__(self, record_file="records.json", encyclopedia_dir="异环鱼类图鉴资源"):
-        self.record_file = record_file
-        self.encyclopedia_dir = encyclopedia_dir
+    def __init__(self, record_file=None, encyclopedia_dir=None):
+        self.record_file = record_file or ensure_writable_file("records.json")
+        self.encyclopedia_dir = encyclopedia_dir or resource_path("异环鱼类图鉴资源")
         self._query_cache = {}
         self._cache_version = 0
         self.records = {

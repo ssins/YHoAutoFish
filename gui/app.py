@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.paths import ensure_writable_file, resource_path
 from core.state_machine import StateMachine
 from gui.encyclopedia import EncyclopediaWidget
 from gui.fishing_record import FishingRecordWidget
@@ -36,7 +37,7 @@ from gui.theme import (
     text_edit_stylesheet,
 )
 
-CONFIG_FILE = "config.json"
+CONFIG_FILE = ensure_writable_file("config.json")
 
 
 class BackdropFrame(QFrame):
@@ -162,10 +163,10 @@ class TitleButton(QPushButton):
 
 
 class LogoImageCard(QFrame):
-    def __init__(self, image_path="logo.jpg", parent=None):
+    def __init__(self, image_path=None, parent=None):
         super().__init__(parent)
-        self.image_path = image_path
-        self.source_pixmap = QPixmap(image_path) if os.path.exists(image_path) else QPixmap()
+        self.image_path = image_path or resource_path("logo.jpg")
+        self.source_pixmap = QPixmap(self.image_path) if os.path.exists(self.image_path) else QPixmap()
         self.setFixedSize(254, 146)
         self.setStyleSheet("QFrame { background: transparent; border: none; }")
 
@@ -1463,7 +1464,7 @@ class AppWindow(QMainWindow):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(16)
 
-        logo_card = LogoImageCard("logo.jpg")
+        logo_card = LogoImageCard()
         add_shadow(logo_card, blur=24, alpha=96, offset=(0, 10))
         layout.addWidget(logo_card, 0, Qt.AlignHCenter)
 
