@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -520,6 +521,12 @@ class FloatingControlWindow(QFrame):
         self._event_hook = None
         self._event_callback = None
         self._pending_hook_update = False
+        self._user_visible_requested = False
+        self._temporarily_hidden_by_game = False
+        self._collapsed = False
+        self._active_page_index = 0
+        self._last_log_version = -1
+        self._last_log_text = None
         self.setWindowTitle("异环自动钓鱼悬浮控制")
         self.setWindowFlags(
             Qt.Tool
@@ -559,27 +566,22 @@ class FloatingControlWindow(QFrame):
         header.addWidget(title)
         header.addStretch()
 
+        self.collapse_btn = QPushButton("−")
+        self.collapse_btn.setFixedSize(30, 30)
+        self.collapse_btn.setFocusPolicy(Qt.NoFocus)
+        self.collapse_btn.setCursor(Qt.PointingHandCursor)
+        self.collapse_btn.setToolTip("折叠悬浮窗")
+        self.collapse_btn.setStyleSheet(self._icon_button_stylesheet())
+        self.collapse_btn.clicked.connect(self.toggle_collapsed)
+        header.addWidget(self.collapse_btn)
+
         self.close_btn = QPushButton("×")
         self.close_btn.setFixedSize(30, 30)
         self.close_btn.setFocusPolicy(Qt.NoFocus)
         self.close_btn.setCursor(Qt.PointingHandCursor)
-        self.close_btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                background-color: rgba(255, 255, 255, 0.05);
-                color: {APP_COLORS['text_dim']};
-                border: 1px solid rgba(111, 145, 182, 0.18);
-                border-radius: 15px;
-                font-size: 16px;
-                font-weight: 900;
-            }}
-            QPushButton:hover {{
-                background-color: rgba(255, 102, 126, 0.24);
-                color: {APP_COLORS['text']};
-            }}
-            """
-        )
-        self.close_btn.clicked.connect(self.hide)
+        self.close_btn.setToolTip("关闭悬浮窗")
+        self.close_btn.setStyleSheet(self._icon_button_stylesheet(danger=True))
+        self.close_btn.clicked.connect(self.hide_by_user)
         header.addWidget(self.close_btn)
         layout.addLayout(header)
 
@@ -587,6 +589,45 @@ class FloatingControlWindow(QFrame):
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setFixedHeight(34)
         layout.addWidget(self.status_label)
+
+        self.mode_bar = QFrame()
+        self.mode_bar.setStyleSheet(
+            """
+            QFrame {
+                background-color: rgba(255, 255, 255, 0.045);
+                border: 1px solid rgba(111, 145, 182, 0.16);
+                border-radius: 17px;
+            }
+            """
+        )
+        mode_layout = QHBoxLayout(self.mode_bar)
+        mode_layout.setContentsMargins(4, 4, 4, 4)
+        mode_layout.setSpacing(4)
+
+        self.control_page_btn = QPushButton("控制")
+        self.control_page_btn.setCheckable(True)
+        self.control_page_btn.setFocusPolicy(Qt.NoFocus)
+        self.control_page_btn.setCursor(Qt.PointingHandCursor)
+        self.control_page_btn.clicked.connect(lambda: self.switch_floating_page(0))
+        mode_layout.addWidget(self.control_page_btn)
+
+        self.log_page_btn = QPushButton("日志")
+        self.log_page_btn.setCheckable(True)
+        self.log_page_btn.setFocusPolicy(Qt.NoFocus)
+        self.log_page_btn.setCursor(Qt.PointingHandCursor)
+        self.log_page_btn.clicked.connect(lambda: self.switch_floating_page(1))
+        mode_layout.addWidget(self.log_page_btn)
+        layout.addWidget(self.mode_bar)
+
+        self.body_stack = QStackedWidget()
+        self.body_stack.setStyleSheet("QStackedWidget { background: transparent; border: none; }")
+        layout.addWidget(self.body_stack)
+
+        self.control_page = QWidget()
+        self.control_page.setStyleSheet("background: transparent; border: none;")
+        control_layout = QVBoxLayout(self.control_page)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        control_layout.setSpacing(11)
 
         actions = QHBoxLayout()
         actions.setSpacing(8)
@@ -604,7 +645,7 @@ class FloatingControlWindow(QFrame):
         self.stop_btn.setCursor(Qt.PointingHandCursor)
         self.stop_btn.clicked.connect(self.app_window.stop_bot)
         actions.addWidget(self.stop_btn)
-        layout.addLayout(actions)
+        control_layout.addLayout(actions)
 
         self.debug_panel = QFrame()
         self.debug_panel.setProperty("variant", "soft")
@@ -634,13 +675,232 @@ class FloatingControlWindow(QFrame):
             """
         )
         debug_layout.addWidget(self.debug_preview)
-        layout.addWidget(self.debug_panel)
+        control_layout.addWidget(self.debug_panel)
+        self.body_stack.addWidget(self.control_page)
+
+        self.log_page = QWidget()
+        self.log_page.setStyleSheet("background: transparent; border: none;")
+        log_layout = QVBoxLayout(self.log_page)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.setSpacing(0)
+
+        self.floating_log_view = QPlainTextEdit()
+        self.floating_log_view.setReadOnly(True)
+        self.floating_log_view.setUndoRedoEnabled(False)
+        self.floating_log_view.setMaximumBlockCount(int(self.app_window.config.get("log_line_limit", 320)))
+        self.floating_log_view.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.floating_log_view.setStyleSheet(self._floating_log_stylesheet())
+        log_layout.addWidget(self.floating_log_view)
+        self.body_stack.addWidget(self.log_page)
+        self.switch_floating_page(0)
 
         self.position_timer = QTimer(self)
         self.position_timer.setTimerType(Qt.PreciseTimer)
         self.position_timer.timeout.connect(self.position_near_game)
-        self.position_timer.start(16)
+        self.position_timer.setInterval(16)
+
+        self.visibility_timer = QTimer(self)
+        self.visibility_timer.setTimerType(Qt.CoarseTimer)
+        self.visibility_timer.timeout.connect(self.sync_game_visibility)
+        self.visibility_timer.setInterval(250)
         self.refresh_state()
+
+    def _icon_button_stylesheet(self, danger=False):
+        hover_bg = "rgba(255, 102, 126, 0.24)" if danger else "rgba(29, 208, 214, 0.16)"
+        hover_border = "rgba(255, 102, 126, 0.34)" if danger else "rgba(29, 208, 214, 0.32)"
+        return f"""
+        QPushButton {{
+            background-color: rgba(255, 255, 255, 0.05);
+            color: {APP_COLORS['text_dim']};
+            border: 1px solid rgba(111, 145, 182, 0.18);
+            border-radius: 15px;
+            font-size: 16px;
+            font-weight: 900;
+        }}
+        QPushButton:hover {{
+            background-color: {hover_bg};
+            border: 1px solid {hover_border};
+            color: {APP_COLORS['text']};
+        }}
+        """
+
+    def _mode_button_stylesheet(self, active=False):
+        if active:
+            return f"""
+            QPushButton {{
+                background-color: rgba(29, 208, 214, 0.22);
+                color: {APP_COLORS['accent_soft']};
+                border: 1px solid rgba(29, 208, 214, 0.35);
+                border-radius: 13px;
+                min-height: 28px;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+            """
+        return f"""
+        QPushButton {{
+            background-color: transparent;
+            color: {APP_COLORS['text_dim']};
+            border: 1px solid transparent;
+            border-radius: 13px;
+            min-height: 28px;
+            font-size: 12px;
+            font-weight: 800;
+        }}
+        QPushButton:hover {{
+            background-color: rgba(255, 255, 255, 0.055);
+            color: {APP_COLORS['text']};
+        }}
+        """
+
+    def _floating_log_stylesheet(self):
+        return f"""
+        QPlainTextEdit {{
+            background-color: rgba(5, 12, 20, 0.82);
+            color: {APP_COLORS['text_dim']};
+            border: 1px solid rgba(87, 119, 153, 0.18);
+            border-radius: 16px;
+            padding: 10px;
+            font-family: Consolas, 'Microsoft YaHei UI';
+            font-size: 12px;
+            selection-background-color: rgba(29, 208, 214, 0.24);
+        }}
+        QScrollBar:vertical {{
+            background: transparent;
+            width: 8px;
+            margin: 8px 2px 8px 0;
+        }}
+        QScrollBar::handle:vertical {{
+            background: rgba(111, 145, 182, 0.32);
+            border-radius: 4px;
+            min-height: 22px;
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0px;
+            border: none;
+            background: transparent;
+        }}
+        """
+
+    def switch_floating_page(self, index):
+        self._active_page_index = 1 if index == 1 else 0
+        self.body_stack.setCurrentIndex(self._active_page_index)
+        self.control_page_btn.setChecked(self._active_page_index == 0)
+        self.log_page_btn.setChecked(self._active_page_index == 1)
+        self.control_page_btn.setStyleSheet(self._mode_button_stylesheet(self._active_page_index == 0))
+        self.log_page_btn.setStyleSheet(self._mode_button_stylesheet(self._active_page_index == 1))
+        if self._active_page_index == 1:
+            self.refresh_log_view(force=True)
+        self.refresh_panel_size()
+
+    def toggle_collapsed(self):
+        self._collapsed = not self._collapsed
+        self.collapse_btn.setText("□" if self._collapsed else "−")
+        self.collapse_btn.setToolTip("展开悬浮窗" if self._collapsed else "折叠悬浮窗")
+        if not self._collapsed and self._active_page_index == 1:
+            self.refresh_log_view(force=True)
+        self.refresh_panel_size()
+        self.position_near_game()
+
+    def refresh_panel_size(self):
+        debug_enabled = bool(self.app_window.config.get("debug_mode", False))
+        self.debug_panel.setVisible(debug_enabled and not self._collapsed and self._active_page_index == 0)
+        self.mode_bar.setVisible(not self._collapsed)
+        self.body_stack.setVisible(not self._collapsed)
+
+        if self._collapsed:
+            width, height = 304, 112
+        elif self._active_page_index == 1:
+            width, height = 340, 410
+        else:
+            width = 304
+            height = 452 if debug_enabled else 226
+
+        self.setFixedSize(width, height)
+        self.adjustSize()
+
+    def refresh_log_view(self, force=False):
+        if not hasattr(self, "floating_log_view"):
+            return
+        if not force and (not self.isVisible() or self._collapsed or self._active_page_index != 1):
+            return
+
+        version = getattr(self.app_window, "_log_version", 0)
+        if not force and version == self._last_log_version:
+            return
+
+        self.floating_log_view.setMaximumBlockCount(int(self.app_window.config.get("log_line_limit", 320)))
+        text = "\n".join(self.app_window.log_deque)
+        if not text:
+            text = "--- 异环自动钓鱼初始化完成 ---\n请确保游戏窗口处于可操作状态。"
+        if force or text != self._last_log_text:
+            self.floating_log_view.setPlainText(text)
+            scrollbar = self.floating_log_view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+            self._last_log_text = text
+        self._last_log_version = version
+
+    @property
+    def user_visible_requested(self):
+        return self._user_visible_requested
+
+    def set_user_visible_requested(self, requested):
+        self._user_visible_requested = bool(requested)
+        if not self._user_visible_requested:
+            self._temporarily_hidden_by_game = False
+            self._release_event_hook()
+            if self.position_timer.isActive():
+                self.position_timer.stop()
+            if self.visibility_timer.isActive():
+                self.visibility_timer.stop()
+            self.hide()
+            self._update_toggle_button()
+            return
+
+        if not self.visibility_timer.isActive():
+            self.visibility_timer.start()
+        self.sync_game_visibility()
+
+    def hide_by_user(self):
+        self.set_user_visible_requested(False)
+
+    def _update_toggle_button(self):
+        if hasattr(self.app_window, "float_toggle_btn"):
+            self.app_window.float_toggle_btn.setText("隐藏" if self._user_visible_requested else "悬浮窗")
+
+    def sync_game_visibility(self):
+        if not self._user_visible_requested:
+            return
+
+        rect = self._current_game_rect(allow_find=True)
+        if rect is None:
+            self._hide_until_game_visible()
+            return
+
+        self._temporarily_hidden_by_game = False
+        self._update_toggle_button()
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+        self.position_near_game(rect)
+
+    def _hide_until_game_visible(self):
+        self._temporarily_hidden_by_game = True
+        self._last_target_pos = None
+        self._release_event_hook()
+        if self.isVisible():
+            self.hide()
+        self._update_toggle_button()
+
+    def _current_game_rect(self, allow_find=False):
+        wm = self.app_window.sm.wm
+        rect = wm.get_client_rect()
+        now = time.monotonic()
+        if rect is None and allow_find and now - self._last_window_find > 1.2:
+            self._last_window_find = now
+            wm.find_window()
+            rect = wm.get_client_rect()
+        return rect
 
     def refresh_state(self):
         running = self.app_window.sm.is_running
@@ -697,10 +957,7 @@ class FloatingControlWindow(QFrame):
         self.refresh_debug_visibility()
 
     def refresh_debug_visibility(self):
-        debug_enabled = bool(self.app_window.config.get("debug_mode", False))
-        self.debug_panel.setVisible(debug_enabled)
-        self.setFixedSize(304, 404 if debug_enabled else 176)
-        self.adjustSize()
+        self.refresh_panel_size()
 
     def _ensure_event_hook(self):
         if self._event_hook:
@@ -712,7 +969,10 @@ class FloatingControlWindow(QFrame):
         def _callback(_hook, event, hwnd_event, id_object, _id_child, _event_thread, _event_time):
             if event != self._EVENT_OBJECT_LOCATIONCHANGE:
                 return
-            if int(hwnd_event) != int(self.app_window.sm.wm.hwnd or 0):
+            target_hwnd = self.app_window.sm.wm.hwnd
+            if not hwnd_event or not target_hwnd:
+                return
+            if int(hwnd_event) != int(target_hwnd):
                 return
             if id_object != self._OBJID_WINDOW:
                 return
@@ -780,34 +1040,35 @@ class FloatingControlWindow(QFrame):
         except Exception:
             self.move(target)
 
-    def position_near_game(self):
+    def position_near_game(self, rect=None):
         if not self.isVisible():
             return
 
-        rect = self.app_window.sm.wm.get_client_rect()
-        now = time.monotonic()
-        if rect is None and now - self._last_window_find > 1.2:
-            self._last_window_find = now
-            self.app_window.sm.wm.find_window()
-            rect = self.app_window.sm.wm.get_client_rect()
+        if rect is None:
+            rect = self._current_game_rect(allow_find=True)
 
         if rect:
             self._ensure_event_hook()
             left, top, _width, _height = rect
             target = QPoint(left + 16, top + 16)
         else:
-            window_rect = self.app_window.geometry()
-            target = QPoint(window_rect.left() + 34, window_rect.top() + 86)
+            self._hide_until_game_visible()
+            return
 
         self._move_to_target(target)
 
     def showEvent(self, event):
         super().showEvent(event)
+        if self._user_visible_requested and not self.position_timer.isActive():
+            self.position_timer.start()
         self.refresh_state()
+        self.refresh_log_view()
         self.position_near_game()
 
     def set_debug_frame(self, frame):
         if frame is None or not self.app_window.config.get("debug_mode", False):
+            return
+        if self._collapsed or self._active_page_index != 0:
             return
         rgb_frame = frame[:, :, ::-1].copy()
         height, width, channel = rgb_frame.shape
@@ -822,10 +1083,16 @@ class FloatingControlWindow(QFrame):
     def hideEvent(self, event):
         super().hideEvent(event)
         self._release_event_hook()
-        if hasattr(self.app_window, "float_toggle_btn"):
-            self.app_window.float_toggle_btn.setText("悬浮窗")
+        if self.position_timer.isActive():
+            self.position_timer.stop()
+        self._update_toggle_button()
 
     def closeEvent(self, event):
+        self._user_visible_requested = False
+        if self.position_timer.isActive():
+            self.position_timer.stop()
+        if self.visibility_timer.isActive():
+            self.visibility_timer.stop()
         self._release_event_hook()
         super().closeEvent(event)
 
@@ -1111,13 +1378,24 @@ class AppWindow(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         self.config = {
-            "hold_threshold": 25,
-            "deadzone_threshold": 10,
+            "tracking_strength": 170,
+            "hold_threshold": 5,
+            "deadzone_threshold": 1,
             "fishing_timeout": 180,
             "hook_wait_timeout": 90,
             "cast_animation_delay": 2,
-            "settlement_close_delay": 2,
-            "bar_missing_timeout": 2,
+            "settlement_close_delay": 1,
+            "bar_missing_timeout": 3,
+            "recovery_timeout": 8,
+            "fishing_result_check_interval": 0.65,
+            "fishing_failed_check_interval": 1.25,
+            "empty_ready_confirm_delay": 0.9,
+            "feed_forward_gain": 0.24,
+            "safe_zone_ratio": 0.10,
+            "control_release_cross_ratio": 0.035,
+            "control_reengage_ratio": 0.065,
+            "control_switch_ratio": 0.11,
+            "control_min_hold_time": 0.12,
             "log_line_limit": 320,
             "auto_switch_to_log": True,
             "debug_mode": False,
@@ -1127,6 +1405,7 @@ class AppWindow(QMainWindow):
         self.log_queue = queue.Queue()
         self.debug_queue = queue.Queue()
         self.log_deque = deque(maxlen=int(self.config.get("log_line_limit", 320)))
+        self._log_version = 0
         self.sm = StateMachine(log_queue=self.log_queue, debug_queue=self.debug_queue)
         self._agreement_shown = False
         self.floating_window = None
@@ -1168,21 +1447,34 @@ class AppWindow(QMainWindow):
     def _sync_runtime_preferences(self):
         self.config["log_line_limit"] = int(self.config.get("log_line_limit", 320))
         self.log_deque = deque(self.log_deque, maxlen=self.config["log_line_limit"])
+        self._log_version += 1
         if hasattr(self, "log_textbox"):
             self.log_textbox.setText("\n".join(self.log_deque))
         self._apply_state_machine_config()
         self._refresh_debug_view_state()
         if self.floating_window is not None:
             self.floating_window.refresh_state()
+            self.floating_window.refresh_log_view(force=True)
 
     def _apply_state_machine_config(self):
-        self.sm.update_config("t_hold", self.config.get("hold_threshold", 25))
-        self.sm.update_config("t_deadzone", self.config.get("deadzone_threshold", 10))
+        self.sm.update_config("tracking_strength", self.config.get("tracking_strength", 170))
+        self.sm.update_config("t_hold", self.config.get("hold_threshold", 5))
+        self.sm.update_config("t_deadzone", self.config.get("deadzone_threshold", 1))
         self.sm.update_config("fishing_timeout", self.config.get("fishing_timeout", 180))
         self.sm.update_config("hook_wait_timeout", self.config.get("hook_wait_timeout", 90))
         self.sm.update_config("cast_animation_delay", self.config.get("cast_animation_delay", 2))
-        self.sm.update_config("settlement_close_delay", self.config.get("settlement_close_delay", 2))
-        self.sm.update_config("bar_missing_timeout", self.config.get("bar_missing_timeout", 2))
+        self.sm.update_config("settlement_close_delay", self.config.get("settlement_close_delay", 1))
+        self.sm.update_config("bar_missing_timeout", self.config.get("bar_missing_timeout", 3))
+        self.sm.update_config("recovery_timeout", self.config.get("recovery_timeout", 8))
+        self.sm.update_config("fishing_result_check_interval", self.config.get("fishing_result_check_interval", 0.65))
+        self.sm.update_config("fishing_failed_check_interval", self.config.get("fishing_failed_check_interval", 1.25))
+        self.sm.update_config("empty_ready_confirm_delay", self.config.get("empty_ready_confirm_delay", 0.9))
+        self.sm.update_config("feed_forward_gain", self.config.get("feed_forward_gain", 0.24))
+        self.sm.update_config("safe_zone_ratio", self.config.get("safe_zone_ratio", 0.10))
+        self.sm.update_config("control_release_cross_ratio", self.config.get("control_release_cross_ratio", 0.035))
+        self.sm.update_config("control_reengage_ratio", self.config.get("control_reengage_ratio", 0.065))
+        self.sm.update_config("control_switch_ratio", self.config.get("control_switch_ratio", 0.11))
+        self.sm.update_config("control_min_hold_time", self.config.get("control_min_hold_time", 0.12))
         self.sm.update_config("debug_mode", self.config.get("debug_mode", False))
 
     def _refresh_debug_view_state(self):
@@ -1439,16 +1731,12 @@ class AppWindow(QMainWindow):
         if self.floating_window is None:
             self.floating_window = FloatingControlWindow(self)
 
-        if self.floating_window.isVisible():
-            self.floating_window.hide()
-            self.float_toggle_btn.setText("悬浮窗")
+        if self.floating_window.user_visible_requested:
+            self.floating_window.set_user_visible_requested(False)
             return
 
         self.floating_window.refresh_state()
-        self.floating_window.show()
-        self.floating_window.raise_()
-        self.floating_window.position_near_game()
-        self.float_toggle_btn.setText("隐藏")
+        self.floating_window.set_user_visible_requested(True)
 
     def _build_sidebar(self):
         panel = QFrame()
@@ -1752,19 +2040,28 @@ class AppWindow(QMainWindow):
         self.slider_hold = self._settings_block(
             content_layout,
             "跟鱼力度",
-            "数值越大，跟鱼时按键会更积极；如出现跟随过猛或过慢，可在此调整。",
-            self.config.get("hold_threshold", 25),
-            10,
-            50,
+            "数值越大，PID 修正和前馈追赶越积极；程序会保持按键到接近越过中心，适配较慢的 A/D 移速。",
+            self.config.get("tracking_strength", 170),
+            70,
+            240,
+            "tracking_strength",
+        )
+        self.slider_hold_threshold = self._settings_block(
+            content_layout,
+            "稳定释放阈值",
+            "游标接近绿条中心时重新触发按键的阈值；默认偏低，减少在中心一侧提前滑行。",
+            self.config.get("hold_threshold", 5),
+            2,
+            30,
             "hold_threshold",
         )
         self.slider_deadzone = self._settings_block(
             content_layout,
             "跟鱼死区",
             "数值越小，鱼漂偏离时越快按键追赶；过低可能导致左右频繁抖动。",
-            self.config.get("deadzone_threshold", 10),
-            2,
-            20,
+            self.config.get("deadzone_threshold", 1),
+            1,
+            15,
             "deadzone_threshold",
         )
         self.slider_timeout = self._settings_block(
@@ -1789,7 +2086,7 @@ class AppWindow(QMainWindow):
             content_layout,
             "耐力条丢失容忍",
             "耐力条短暂识别不到时等待的秒数；画面抖动或帧率低可适当调大。",
-            self.config.get("bar_missing_timeout", 2),
+            self.config.get("bar_missing_timeout", 3),
             1,
             5,
             "bar_missing_timeout",
@@ -1807,7 +2104,7 @@ class AppWindow(QMainWindow):
             content_layout,
             "结算关闭等待",
             "捕获后按 ESC 关闭结算界面，再等待回到可抛竿状态的秒数。",
-            self.config.get("settlement_close_delay", 2),
+            self.config.get("settlement_close_delay", 1),
             1,
             5,
             "settlement_close_delay",
@@ -1991,8 +2288,13 @@ class AppWindow(QMainWindow):
 
         line = f"[{time.strftime('%H:%M:%S')}] {msg}"
         self.log_deque.append(line)
-        self.log_textbox.setText("\n".join(self.log_deque))
-        self.log_textbox.verticalScrollBar().setValue(self.log_textbox.verticalScrollBar().maximum())
+        self._log_version += 1
+        log_text = "\n".join(self.log_deque)
+        if hasattr(self, "log_textbox"):
+            self.log_textbox.setText(log_text)
+            self.log_textbox.verticalScrollBar().setValue(self.log_textbox.verticalScrollBar().maximum())
+        if self.floating_window is not None:
+            self.floating_window.refresh_log_view()
 
     def process_queue(self):
         try:

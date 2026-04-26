@@ -47,7 +47,28 @@ class WindowManager:
             # 默认取第一个匹配的窗口句柄
             self.hwnd = hwnds[0]
             return True
+        if self.hwnd and not self.is_window_alive():
+            self.hwnd = None
         return False
+
+    def is_window_alive(self):
+        """当前缓存的游戏窗口句柄是否仍然有效。"""
+        if not self.hwnd:
+            return False
+        try:
+            return bool(win32gui.IsWindow(self.hwnd))
+        except Exception:
+            self.hwnd = None
+            return False
+
+    def is_window_visible_and_restored(self):
+        """游戏窗口可见且未最小化时，才适合绑定悬浮窗和截图。"""
+        if not self.is_window_alive():
+            return False
+        try:
+            return bool(win32gui.IsWindowVisible(self.hwnd)) and not bool(win32gui.IsIconic(self.hwnd))
+        except Exception:
+            return False
 
     def get_client_rect(self):
         """
@@ -55,7 +76,7 @@ class WindowManager:
         去除窗口标题栏和边框的影响。
         返回: (left, top, width, height)
         """
-        if not self.hwnd:
+        if not self.is_window_visible_and_restored():
             return None
         
         try:
@@ -78,19 +99,19 @@ class WindowManager:
 
     def get_dpi_scale(self):
         """返回当前游戏窗口相对 96 DPI 的缩放倍率，用于调试和模板缩放参考。"""
-        if not self.hwnd:
+        if not self.is_window_alive():
             return 1.0
         return dpi_scale_for_window(self.hwnd)
 
     def is_foreground(self):
         """检查游戏窗口是否在最前面（获得焦点），用于防误触保护"""
-        if not self.hwnd:
+        if not self.is_window_alive():
             return False
         return win32gui.GetForegroundWindow() == self.hwnd
 
     def set_foreground(self):
         """尝试将窗口置顶并获取焦点"""
-        if self.hwnd:
+        if self.is_window_alive():
             try:
                 # 若窗口最小化，先恢复
                 if win32gui.IsIconic(self.hwnd):

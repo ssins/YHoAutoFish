@@ -35,6 +35,11 @@ class RecordManager:
         "total_attempts": 0,
         "consecutive_empty": 0,
     }
+    DEFAULT_SUMMARY = {
+        "last_record_id": 0,
+        "last_history_len": 0,
+        "last_time": "",
+    }
 
     def __init__(self, record_file=None, encyclopedia_dir=None):
         self.record_file = record_file or ensure_writable_file("records.json")
@@ -45,12 +50,16 @@ class RecordManager:
             "stats": dict(self.DEFAULT_STATS),
             "encyclopedia": {},
             "history": [],
-            "summary": {"last_history_len": 0, "last_time": ""},
+            "summary": dict(self.DEFAULT_SUMMARY),
+            "next_record_id": 1,
         }
         self._load_failed = False
+        self._migration_needed = False
         self.load_records()
         if not self._load_failed:
             self._sync_encyclopedia_images()
+            if self._migration_needed:
+                self.save_records()
 
     def _touch_cache(self):
         self._cache_version += 1
@@ -81,8 +90,92 @@ class RecordManager:
         self.records["stats"].update(data.get("stats", {}))
         self.records["history"] = data.get("history", [])
         self.records["encyclopedia"] = data.get("encyclopedia", {})
-        self.records["summary"] = data.get("summary", {"last_history_len": 0, "last_time": ""})
+        raw_summary = data.get("summary", {})
+        summary = dict(self.DEFAULT_SUMMARY)
+        summary.update(raw_summary)
+        if isinstance(raw_summary, dict) and "last_record_id" not in raw_summary:
+            summary.pop("last_record_id", None)
+        self.records["summary"] = summary
+        self.records["next_record_id"] = data.get("next_record_id", 1)
+        self._migrate_record_ids()
         self._touch_cache()
+
+    def _safe_int(self, value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _migrate_record_ids(self):
+        history = self.records.get("history", [])
+        if not isinstance(history, list):
+            self.records["history"] = []
+            history = self.records["history"]
+            self._migration_needed = True
+
+        used_ids = set()
+        next_candidate = 1
+        for record in history:
+            if not isinstance(record, dict):
+                continue
+            record_id = self._safe_int(record.get("record_id"), 0)
+            if record_id <= 0 or record_id in used_ids:
+                while next_candidate in used_ids:
+                    next_candidate += 1
+                record["record_id"] = next_candidate
+                used_ids.add(next_candidate)
+                next_candidate += 1
+                self._migration_needed = True
+            else:
+                record["record_id"] = record_id
+                used_ids.add(record_id)
+
+        max_record_id = max(used_ids, default=0)
+        next_record_id = self._safe_int(self.records.get("next_record_id"), 1)
+        normalized_next_id = max(next_record_id, max_record_id + 1, 1)
+        if self.records.get("next_record_id") != normalized_next_id:
+            self.records["next_record_id"] = normalized_next_id
+            self._migration_needed = True
+
+        summary = self.records.setdefault("summary", dict(self.DEFAULT_SUMMARY))
+        last_record_id = self._safe_int(summary.get("last_record_id"), -1)
+        if last_record_id < 0:
+            last_record_id = 0
+
+        if "last_record_id" not in summary:
+            cursor = self._safe_int(summary.get("last_history_len"), 0)
+            if 0 < cursor <= len(history):
+                candidate = history[cursor - 1]
+                if isinstance(candidate, dict):
+                    last_record_id = self._safe_int(candidate.get("record_id"), 0)
+            elif cursor <= 0:
+                last_record_id = 0
+            else:
+                last_time = summary.get("last_time", "")
+                if last_time:
+                    matched_ids = [
+                        self._safe_int(record.get("record_id"), 0)
+                        for record in history
+                        if isinstance(record, dict) and record.get("time", "") <= last_time
+                    ]
+                    last_record_id = max(matched_ids, default=max_record_id)
+                else:
+                    last_record_id = max_record_id
+            self._migration_needed = True
+
+        normalized_summary = {
+            "last_record_id": max(0, last_record_id),
+            "last_history_len": self._safe_int(summary.get("last_history_len"), 0),
+            "last_time": summary.get("last_time", ""),
+        }
+        if summary != normalized_summary:
+            self.records["summary"] = normalized_summary
+            self._migration_needed = True
+
+    def _next_record_id(self):
+        record_id = max(1, self._safe_int(self.records.get("next_record_id"), 1))
+        self.records["next_record_id"] = record_id + 1
+        return record_id
 
     def save_records(self):
         try:
@@ -450,6 +543,7 @@ class RecordManager:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             self.records["history"].append(
                 {
+                    "record_id": self._next_record_id(),
                     "time": timestamp,
                     "fish_name": canonical_name or "未知鱼类",
                     "weight": int(weight_g or 0),
@@ -457,8 +551,6 @@ class RecordManager:
                     "image_path": "",
                 }
             )
-            if len(self.records["history"]) > 1000:
-                self.records["history"] = self.records["history"][-1000:]
             self._touch_cache()
             self.save_records()
             return
@@ -483,6 +575,7 @@ class RecordManager:
 
         self.records["history"].append(
             {
+                "record_id": self._next_record_id(),
                 "time": timestamp,
                 "fish_name": canonical_name,
                 "weight": int(weight_g or 0),
@@ -490,9 +583,6 @@ class RecordManager:
                 "image_path": fish_data.get("image_path", ""),
             }
         )
-
-        if len(self.records["history"]) > 1000:
-            self.records["history"] = self.records["history"][-1000:]
 
         self._touch_cache()
         self.save_records()
@@ -510,14 +600,14 @@ class RecordManager:
 
     def get_unsummarized_history(self):
         history = self.records.get("history", [])
-        summary = self.records.setdefault("summary", {"last_history_len": 0, "last_time": ""})
-        try:
-            cursor = int(summary.get("last_history_len", 0) or 0)
-        except (TypeError, ValueError):
-            cursor = 0
+        summary = self.records.setdefault("summary", dict(self.DEFAULT_SUMMARY))
+        last_record_id = self._safe_int(summary.get("last_record_id"), 0)
 
-        if 0 <= cursor <= len(history):
-            return list(history[cursor:])
+        if last_record_id >= 0:
+            return [
+                record for record in history
+                if self._safe_int(record.get("record_id"), 0) > last_record_id
+            ]
 
         last_time = summary.get("last_time", "")
         if last_time:
@@ -526,7 +616,9 @@ class RecordManager:
 
     def mark_summary_completed(self):
         history = self.records.get("history", [])
+        last_record_id = max((self._safe_int(record.get("record_id"), 0) for record in history), default=0)
         self.records["summary"] = {
+            "last_record_id": last_record_id,
             "last_history_len": len(history),
             "last_time": history[-1].get("time", "") if history else "",
         }

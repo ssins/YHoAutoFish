@@ -37,6 +37,7 @@ class StateMachine:
     STATE_RESULT = 3
     STATE_FAILED = 4
     STATE_PAUSED = 5
+    STATE_RECOVERING = 6
     
     def __init__(self, log_queue=None, debug_queue=None, config=None):
         self.log_queue = log_queue
@@ -45,6 +46,7 @@ class StateMachine:
         self.wm = WindowManager()
         self.sc = None 
         self.ctrl = Controller()
+        self._input_lock = threading.RLock()
         self.vis = VisionCore()
         self.record_mgr = RecordManager()
         self.ocr = {}
@@ -58,6 +60,9 @@ class StateMachine:
         self._last_name_ocr_candidates = []
         self._last_weight_ocr_candidates = []
         self._last_weight_corrections = []
+        self.roi_f_btn = (0.75, 0.75, 0.25, 0.25)
+        self.roi_initial_controls = (0.70, 0.50, 0.30, 0.50)
+        self._ready_heavy_last_check = 0
         
         self.is_running = False
         self.current_state = self.STATE_IDLE
@@ -72,16 +77,28 @@ class StateMachine:
         self.pid = PIDController(kp=1.2, ki=0.01, kd=0.4, output_limits=(-100, 100))
         self.total_runtime = 0
         self.start_timestamp = 0
+        self._stop_requested = False
         
         # 参数配置 (后续可由 GUI 更新)
         self.config = config or {
-            "t_hold": 15,       # 长按阈值像素
-            "t_deadzone": 5,    # 死区像素
-            "debug_mode": True,
+            "t_hold": 5,        # 安全区内重新触发按键的阈值
+            "t_deadzone": 1,    # 追赶触发死区
+            "tracking_strength": 170,
+            "debug_mode": False,
             "cast_animation_delay": 2,
-            "settlement_close_delay": 2,
-            "bar_missing_timeout": 2,
+            "settlement_close_delay": 1,
+            "bar_missing_timeout": 3,
             "hook_wait_timeout": 90,
+            "recovery_timeout": 8,
+            "fishing_result_check_interval": 0.65,
+            "fishing_failed_check_interval": 1.25,
+            "empty_ready_confirm_delay": 0.9,
+            "feed_forward_gain": 0.24,
+            "safe_zone_ratio": 0.10,
+            "control_release_cross_ratio": 0.035,
+            "control_reengage_ratio": 0.065,
+            "control_switch_ratio": 0.11,
+            "control_min_hold_time": 0.12,
         }
         self._asset_template_cache = {}
         
@@ -92,14 +109,31 @@ class StateMachine:
         else:
             print(msg)
 
+    def _should_stop(self):
+        return bool(getattr(self, "_stop_requested", False) or not getattr(self, "is_running", False))
+
+    def _tap_key_if_running(self, key, duration=0.01):
+        with self._input_lock:
+            if self._should_stop():
+                return False
+            self.ctrl.key_tap(key, duration=duration)
+            return True
+
+    def _sleep_interruptible(self, seconds, step=0.05):
+        deadline = time.time() + max(0.0, float(seconds))
+        while time.time() < deadline:
+            if getattr(self, "_stop_requested", False):
+                return False
+            time.sleep(min(step, deadline - time.time()))
+        return not getattr(self, "_stop_requested", False)
+
     def start(self):
         """启动状态机"""
         if self.is_running: return
+        self._stop_requested = False
         self.is_running = True
         self.current_state = self.STATE_IDLE
-        self._waiting_start_time = 0
-        self._fishing_start_time = 0
-        self._missing_start_time = 0
+        self._reset_round_state()
         self.start_timestamp = time.time()
         self._log("钓鱼脚本启动中，正在寻找游戏窗口...")
         
@@ -110,8 +144,11 @@ class StateMachine:
     def stop(self):
         """停止状态机"""
         if not self.is_running: return
+        with self._input_lock:
+            self._stop_requested = True
+            self.is_running = False
+            self.ctrl.release_all()
         self._log("[系统] 收到停止指令。")
-        self.is_running = False
         
         # 记录本次运行时长
         if self.start_timestamp > 0:
@@ -169,6 +206,41 @@ class StateMachine:
             required_keywords=("F键图标",),
         )
 
+    def _initial_q_button_templates(self):
+        return self._resolve_asset_templates(
+            "initial_q_button",
+            exact_names=("初始钓鱼界面的Q键进入售鱼界面按钮图标（暗色）.png", "初始钓鱼界面的Q键进入售鱼界面按钮图标（亮色）.png"),
+            required_keywords=("初始钓鱼界面", "Q键"),
+        )
+
+    def _initial_e_button_templates(self):
+        return self._resolve_asset_templates(
+            "initial_e_button",
+            exact_names=("初始钓鱼界面的E键更换鱼饵按钮图标（暗色）.png", "初始钓鱼界面的E键更换鱼饵按钮图标（亮色）.png"),
+            required_keywords=("初始钓鱼界面", "E键"),
+        )
+
+    def _initial_r_button_templates(self):
+        return self._resolve_asset_templates(
+            "initial_r_button",
+            exact_names=("初始钓鱼界面的R键进入钓鱼商店按钮图标（暗色）.png", "初始钓鱼界面的R键进入钓鱼商店按钮图标（亮色）.png"),
+            required_keywords=("初始钓鱼界面", "R键"),
+        )
+
+    def _ready_start_button_templates(self):
+        return self._resolve_asset_templates(
+            "ready_start_button",
+            exact_names=("钓鱼准备界面开始钓鱼按钮.png",),
+            required_keywords=("开始钓鱼",),
+        )
+
+    def _ready_panel_templates(self):
+        return self._resolve_asset_templates(
+            "ready_panel",
+            exact_names=("钓鱼准备界面右侧UI.png",),
+            required_keywords=("钓鱼准备界面", "右侧UI"),
+        )
+
     def _hook_text_templates(self):
         return self._resolve_asset_templates(
             "hook_text",
@@ -183,12 +255,497 @@ class StateMachine:
             required_keywords=("鱼儿溜走了",),
         )
 
+    def _weight_unit_templates(self):
+        return self._resolve_asset_templates(
+            "weight_unit_g",
+            exact_names=("成功上鱼结算画面重量单位银色的g.png",),
+            required_keywords=("重量单位", "g"),
+        )
+
+    def _success_close_prompt_templates(self):
+        return self._resolve_asset_templates(
+            "success_close_prompt",
+            exact_names=("成功上鱼结算画面点击关闭提示（辅助判断成功上鱼）.png",),
+            required_keywords=("成功上鱼结算画面", "点击关闭提示"),
+        )
+
+    def _success_exp_templates(self):
+        return self._resolve_asset_templates(
+            "success_exp",
+            exact_names=("成功上鱼结算画面获得经验（辅助判断成功上鱼）.png",),
+            required_keywords=("成功上鱼结算画面", "获得经验"),
+        )
+
+    def _cursor_templates(self):
+        return self._resolve_asset_templates(
+            "fishing_cursor",
+            exact_names=("溜鱼游标1.png", "溜鱼游标2.png", "溜鱼游标3.png", "溜鱼游标4.png", "溜鱼游标5.png"),
+            required_keywords=("溜鱼", "游标"),
+        )
+
     def _template_scale_range(self, rect, low_factor=0.65, high_factor=1.45):
         if not rect:
             base_scale = 1.0
         else:
             base_scale = max(0.40, min(float(rect[3]) / 900.0, 3.00))
         return max(0.25, base_scale * low_factor), min(4.00, base_scale * high_factor)
+
+    def _f_button_match_strategies(self):
+        return (
+            {"name": "binary-145-mask", "threshold": 0.58, "use_binary": True, "binary_threshold": 145, "use_mask": True},
+            {"name": "binary-115-mask", "threshold": 0.56, "use_binary": True, "binary_threshold": 115, "use_mask": True},
+            {"name": "binary-175-mask", "threshold": 0.58, "use_binary": True, "binary_threshold": 175, "use_mask": True},
+            {"name": "edge", "threshold": 0.52, "use_edge": True, "use_binary": False, "use_mask": False},
+            {"name": "gray-mask", "threshold": 0.55, "use_edge": False, "use_binary": False, "use_mask": True},
+        )
+
+    def _initial_control_match_strategies(self):
+        return (
+            {"name": "control-gray-mask", "threshold": 0.60, "use_mask": True, "mask_threshold": 6},
+            {"name": "control-edge", "threshold": 0.54, "use_edge": True},
+            {"name": "control-plain", "threshold": 0.62},
+        )
+
+    def _normalize_tracking_strength(self):
+        try:
+            raw_value = float(self.config.get("tracking_strength", 170))
+        except (TypeError, ValueError):
+            raw_value = 170.0
+        strength = raw_value / 100.0 if raw_value > 5 else raw_value
+        return max(0.70, min(strength, 1.80))
+
+    def _normalize_ratio_config(self, key, default, minimum, maximum):
+        try:
+            value = float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(value, maximum))
+
+    def _reset_round_state(self, release_keys=True):
+        if release_keys:
+            self.ctrl.release_all()
+        self.pid.reset()
+        self._waiting_start_time = 0
+        self._last_cast_time = 0
+        self._waiting_recast_count = 0
+        self._waiting_ready_recheck_last = 0
+        self._fishing_start_time = 0
+        self.fishing_start_time = 0
+        self._missing_start_time = 0
+        self._last_cursor_x = None
+        self._seen_fishing_bar = False
+        self._last_target_time = 0
+        self._last_target_x = None
+        self._target_velocity = 0
+        self._last_valid_target_x = None
+        self._last_valid_target_w = None
+        self._last_valid_bar_time = 0
+        self._last_valid_cursor_x = None
+        self._last_valid_cursor_time = 0
+        self._bar_cursor_jump_reject_count = 0
+        self._bar_jump_reject_count = 0
+        self._fish_control_direction = 0
+        self._fish_control_min_hold_until = 0
+        self._fish_control_last_change = 0
+        self._confirmed_fishing_bar = False
+        self._bar_seen_streak = 0
+        self._bar_first_seen_time = 0
+        self._last_bar_seen_time = 0
+        self._fishing_bar_confirmed_time = 0
+        self._round_had_fishing_bar = False
+        self._result_empty_recorded = False
+        self._result_quick_check_last = 0
+        self._result_full_check_last = 0
+        self._fishing_result_check_last = 0
+        self._fishing_failed_check_last = 0
+        self._result_ready_seen_time = 0
+        self._result_ready_confirm_count = 0
+        self._result_ready_last_kind = ""
+        self._result_ready_debug_saved = False
+        self._recovery_start_time = 0
+        self._recovery_reason = ""
+        self._recovery_esc_requested = False
+        self._recovery_esc_sent = False
+        self._recovery_second_esc_sent = False
+        self._recovery_empty_recorded = False
+
+    def _prepare_fishing_round_state(self, start_time=None):
+        start_time = start_time or time.time()
+        self.pid.reset()
+        self._fishing_start_time = start_time
+        self.fishing_start_time = start_time
+        self._missing_start_time = 0
+        self._last_cursor_x = None
+        self._seen_fishing_bar = False
+        self._last_target_time = 0
+        self._last_target_x = None
+        self._target_velocity = 0
+        self._last_valid_target_x = None
+        self._last_valid_target_w = None
+        self._last_valid_bar_time = 0
+        self._last_valid_cursor_x = None
+        self._last_valid_cursor_time = 0
+        self._bar_cursor_jump_reject_count = 0
+        self._bar_jump_reject_count = 0
+        self._fish_control_direction = 0
+        self._fish_control_min_hold_until = 0
+        self._fish_control_last_change = 0
+        self._confirmed_fishing_bar = False
+        self._bar_seen_streak = 0
+        self._bar_first_seen_time = 0
+        self._last_bar_seen_time = 0
+        self._fishing_bar_confirmed_time = 0
+        self._round_had_fishing_bar = False
+        self._result_empty_recorded = False
+        self._result_quick_check_last = 0
+        self._result_full_check_last = 0
+        self._fishing_result_check_last = 0
+        self._fishing_failed_check_last = 0
+        self._result_ready_seen_time = 0
+        self._result_ready_confirm_count = 0
+        self._result_ready_last_kind = ""
+        self._result_ready_debug_saved = False
+
+    def _detect_initial_control_cluster(self, rect):
+        if self.sc is None or not rect:
+            return {"count": 0, "matches": [], "confidence": 0.0}
+
+        controls_roi = getattr(self, "roi_initial_controls", (0.70, 0.50, 0.30, 0.50))
+        controls_img = self.sc.capture_relative(rect, *controls_roi)
+        if controls_img is None:
+            return {"count": 0, "matches": [], "confidence": 0.0}
+
+        button_sets = (
+            ("Q", self._initial_q_button_templates()),
+            ("E", self._initial_e_button_templates()),
+            ("R", self._initial_r_button_templates()),
+        )
+        matches = []
+        best_conf = 0.0
+        for key_name, templates in button_sets:
+            loc, conf, matched_path, strategy_name = self.vis.find_best_template_multi_strategy(
+                controls_img,
+                templates,
+                self._initial_control_match_strategies(),
+                threshold=0.58,
+                scale_range=self._template_scale_range(rect, 0.50, 1.80),
+                scale_steps=9,
+            )
+            best_conf = max(best_conf, float(conf or 0.0))
+            if loc:
+                matches.append({
+                    "key": key_name,
+                    "location": loc,
+                    "confidence": conf,
+                    "template": matched_path,
+                    "strategy": strategy_name,
+                })
+
+        if matches:
+            avg_conf = sum(item["confidence"] for item in matches) / len(matches)
+        else:
+            avg_conf = best_conf
+        return {"count": len(matches), "matches": matches, "confidence": avg_conf}
+
+    def _format_initial_controls(self, cluster_info):
+        parts = []
+        for item in (cluster_info or {}).get("matches", []):
+            matched_path = item.get("template")
+            matched_name = Path(matched_path).name if matched_path else "未知模板"
+            parts.append(f"{item.get('key')}:{item.get('confidence', 0):.2f}/{matched_name}/{item.get('strategy') or '默认'}")
+        return "；".join(parts) if parts else "无"
+
+    def _detect_ready_to_cast(self, rect, allow_heavy=False, require_initial_controls=False, include_f=True):
+        if self.sc is None or not rect:
+            return None
+
+        best_conf = -1.0
+        initial_cluster = None
+
+        if include_f:
+            f_roi = getattr(self, "roi_f_btn", (0.75, 0.75, 0.25, 0.25))
+            btn_img = self.sc.capture_relative(rect, *f_roi)
+        else:
+            btn_img = None
+
+        if include_f and btn_img is not None:
+            loc, conf, matched_path, strategy_name = self.vis.find_best_template_multi_strategy(
+                btn_img,
+                self._f_button_templates(),
+                self._f_button_match_strategies(),
+                threshold=0.58,
+                scale_range=self._template_scale_range(rect, 0.55, 1.65),
+                scale_steps=11,
+            )
+            best_conf = conf
+            if loc:
+                if require_initial_controls:
+                    initial_cluster = self._detect_initial_control_cluster(rect)
+                else:
+                    initial_cluster = {"count": 0, "matches": [], "confidence": 0.0}
+                if require_initial_controls and initial_cluster.get("count", 0) < 2:
+                    return {
+                        "kind": "F键图标",
+                        "confidence": conf,
+                        "location": None,
+                        "template": matched_path,
+                        "strategy": strategy_name,
+                        "initial_controls": initial_cluster,
+                    }
+                return {
+                    "kind": "钓鱼初始界面" if initial_cluster.get("count", 0) >= 2 else "F键图标",
+                    "confidence": conf,
+                    "location": loc,
+                    "template": matched_path,
+                    "strategy": strategy_name,
+                    "initial_controls": initial_cluster,
+                }
+
+        if require_initial_controls and include_f:
+            return {
+                "kind": "钓鱼初始界面",
+                "confidence": best_conf,
+                "location": None,
+                "template": None,
+                "initial_controls": initial_cluster or {"count": 0, "matches": [], "confidence": 0.0},
+            } if best_conf >= 0 else None
+
+        start_button_roi = (0.15, 0.74, 0.70, 0.23)
+        start_img = self.sc.capture_relative(rect, *start_button_roi)
+        if start_img is not None:
+            loc, conf, matched_path, strategy_name = self.vis.find_best_template_multi_strategy(
+                start_img,
+                self._ready_start_button_templates(),
+                (
+                    {"name": "gray-mask", "threshold": 0.56, "use_mask": True},
+                    {"name": "edge", "threshold": 0.54, "use_edge": True},
+                    {"name": "plain", "threshold": 0.58},
+                ),
+                threshold=0.56,
+                scale_range=self._template_scale_range(rect, 0.62, 1.55),
+                scale_steps=9,
+            )
+            if conf > best_conf:
+                best_conf = conf
+            if loc:
+                return {
+                    "kind": "开始钓鱼按钮",
+                    "confidence": conf,
+                    "location": loc,
+                    "template": matched_path,
+                    "strategy": strategy_name,
+                }
+
+        if allow_heavy:
+            now = time.time()
+            if now - getattr(self, "_ready_heavy_last_check", 0) >= 3.0:
+                self._ready_heavy_last_check = now
+                full_img = self.sc.capture_relative(rect, 0, 0, 1, 1)
+                if full_img is not None:
+                    loc, conf, matched_path = self.vis.find_best_template(
+                        full_img,
+                        self._ready_panel_templates(),
+                        threshold=0.70,
+                        use_edge=True,
+                        use_binary=False,
+                        scale_range=self._template_scale_range(rect, 0.62, 1.55),
+                        scale_steps=7,
+                    )
+                    if conf > best_conf:
+                        best_conf = conf
+                    if loc:
+                        return {
+                            "kind": "钓鱼准备界面",
+                            "confidence": conf,
+                            "location": loc,
+                            "template": matched_path,
+                        }
+
+        return {
+            "kind": "",
+            "confidence": best_conf,
+            "location": None,
+            "template": None,
+        } if best_conf >= 0 else None
+
+    def _send_cast_input(self, ready_info, source_label):
+        with self._input_lock:
+            if self._should_stop():
+                return False
+            matched_path = ready_info.get("template") if ready_info else None
+            matched_name = Path(matched_path).name if matched_path else "未知模板"
+            confidence = float((ready_info or {}).get("confidence") or 0.0)
+            strategy = (ready_info or {}).get("strategy") or "默认"
+            kind = (ready_info or {}).get("kind") or "可抛钩提示"
+            self._log(f"[{source_label}] 识别到{kind} (置信度: {confidence:.2f}，模板: {matched_name}，策略: {strategy})。准备抛竿。")
+            self._log(f"[{source_label}] > 正在向游戏发送 'F' 键点按指令 (150ms)...")
+            self.ctrl.release_all()
+            self.ctrl.key_tap('F', duration=0.15)
+            self._last_cast_time = time.time()
+            self._waiting_start_time = self._last_cast_time
+            return True
+
+    def _detect_cast_prompt_after_settlement(self, rect):
+        if self.sc is None or not rect:
+            return None
+
+        f_roi = getattr(self, "roi_f_btn", (0.75, 0.75, 0.25, 0.25))
+        btn_img = self.sc.capture_relative(rect, *f_roi)
+        if btn_img is None:
+            return None
+
+        loc, conf, matched_path, strategy_name = self.vis.find_best_template_multi_strategy(
+            btn_img,
+            self._f_button_templates(),
+            (
+                {"name": "settlement-f-gray", "threshold": 0.60, "use_mask": True},
+            ),
+            threshold=0.60,
+            scale_range=self._template_scale_range(rect, 0.82, 1.28),
+            scale_steps=3,
+        )
+        if not loc:
+            return None
+        return {
+            "kind": "F键图标",
+            "confidence": conf,
+            "location": loc,
+            "template": matched_path,
+            "strategy": strategy_name,
+        }
+
+    def _enter_recovering(self, reason, record_empty=False, press_esc=False):
+        self.ctrl.release_all()
+        if record_empty:
+            self.record_mgr.add_empty_catch()
+            self._log("[恢复] 已记录一次空杆/失败尝试。")
+        self._reset_round_state()
+        self._recovery_start_time = time.time()
+        self._recovery_reason = reason
+        self._recovery_esc_requested = bool(press_esc)
+        self._recovery_esc_sent = False
+        self._recovery_second_esc_sent = False
+        self._recovery_empty_recorded = bool(record_empty)
+        self.current_state = self.STATE_RECOVERING
+        self._log(f"[恢复] {reason}，开始等待可抛钩界面恢复。")
+
+    def _filter_bar_detection(self, target_x, cursor_x, target_w, confidence, roi_width):
+        now = time.time()
+        if target_x is None or cursor_x is None or target_w is None:
+            previous_time = getattr(self, "_last_valid_bar_time", 0)
+            if previous_time and now - previous_time <= 0.35:
+                fallback_target = self._last_valid_target_x if target_x is None else target_x
+                fallback_cursor = self._last_valid_cursor_x if cursor_x is None else cursor_x
+                fallback_width = self._last_valid_target_w if target_w is None else target_w
+                if fallback_target is not None and fallback_cursor is not None and fallback_width is not None:
+                    return fallback_target, fallback_cursor, fallback_width, max(float(confidence or 0.0), 0.30)
+            return None, cursor_x, target_w, confidence
+
+        min_confidence = self._normalize_ratio_config("bar_confidence_threshold", 0.45, 0.25, 0.85)
+        if confidence < min_confidence:
+            previous_time = getattr(self, "_last_valid_bar_time", 0)
+            if previous_time and now - previous_time <= 0.45:
+                return self._last_valid_target_x, cursor_x, self._last_valid_target_w, confidence
+            return None, cursor_x, target_w, confidence
+
+        previous_cursor_x = getattr(self, "_last_valid_cursor_x", None)
+        previous_cursor_time = getattr(self, "_last_valid_cursor_time", 0)
+        if previous_cursor_x is not None and previous_cursor_time and now - previous_cursor_time <= 0.75:
+            cursor_jump = abs(cursor_x - previous_cursor_x)
+            cursor_jump_limit = max(72, int(roi_width * 0.24))
+            if cursor_jump > cursor_jump_limit and confidence < 0.86:
+                self._bar_cursor_jump_reject_count = int(getattr(self, "_bar_cursor_jump_reject_count", 0)) + 1
+                if self._bar_cursor_jump_reject_count <= 2:
+                    cursor_x = previous_cursor_x
+                    confidence = max(0.0, confidence * 0.75)
+                else:
+                    return None, cursor_x, target_w, confidence
+
+        previous_x = getattr(self, "_last_valid_target_x", None)
+        previous_w = getattr(self, "_last_valid_target_w", None) or target_w
+        previous_time = getattr(self, "_last_valid_bar_time", 0)
+        if previous_x is not None and previous_time and now - previous_time <= 0.9:
+            jump = abs(target_x - previous_x)
+            jump_limit = max(56, int(roi_width * 0.18), int(max(previous_w, target_w) * 1.55))
+            if jump > jump_limit and confidence < 0.82:
+                self._bar_jump_reject_count = int(getattr(self, "_bar_jump_reject_count", 0)) + 1
+                if self._bar_jump_reject_count <= 3 and now - previous_time <= 0.65:
+                    return previous_x, cursor_x, previous_w, max(0.0, confidence * 0.7)
+                return None, cursor_x, target_w, confidence
+
+        self._last_valid_target_x = int(target_x)
+        self._last_valid_target_w = int(target_w)
+        self._last_valid_bar_time = now
+        self._last_valid_cursor_x = int(cursor_x)
+        self._last_valid_cursor_time = now
+        self._bar_jump_reject_count = 0
+        self._bar_cursor_jump_reject_count = 0
+        return target_x, cursor_x, target_w, confidence
+
+    def _control_pixels(self, target_w):
+        width = max(1.0, float(target_w or 0))
+        release_cross = width * self._normalize_ratio_config("control_release_cross_ratio", 0.035, 0.015, 0.12)
+        reengage = width * self._normalize_ratio_config("control_reengage_ratio", 0.065, 0.025, 0.18)
+        switch_error = width * self._normalize_ratio_config("control_switch_ratio", 0.11, 0.05, 0.25)
+        return {
+            "release_cross": max(1.5, min(release_cross, 8.0)),
+            "reengage": max(3.0, min(reengage, 14.0)),
+            "switch_error": max(5.0, min(switch_error, 24.0)),
+        }
+
+    def _choose_fishing_control_direction(self, error, target_w, target_velocity, total_signal, engage_threshold):
+        pixels = self._control_pixels(target_w)
+        current = int(getattr(self, "_fish_control_direction", 0) or 0)
+        if current not in (-1, 0, 1):
+            current = 0
+
+        now = time.time()
+        signed_error = float(error) * current if current else 0.0
+
+        if current:
+            if signed_error <= -pixels["switch_error"]:
+                return -current
+            if now < getattr(self, "_fish_control_min_hold_until", 0) and signed_error > -pixels["switch_error"]:
+                return current
+            if signed_error <= -pixels["release_cross"]:
+                return 0
+            return current
+
+        abs_error = abs(float(error))
+        abs_signal = abs(float(total_signal))
+        if abs_error >= pixels["reengage"]:
+            return 1 if error > 0 else -1
+        if abs_error >= pixels["release_cross"] and abs_signal >= max(1.0, float(engage_threshold)):
+            return 1 if error > 0 else -1
+        if abs_signal >= max(2.0, float(engage_threshold) * 1.35):
+            return 1 if total_signal > 0 else -1
+        return 0
+
+    def _apply_fishing_control_direction(self, direction):
+        with self._input_lock:
+            if self._should_stop():
+                self.ctrl.release_all()
+                return
+            direction = 1 if direction > 0 else (-1 if direction < 0 else 0)
+            now = time.time()
+            previous = int(getattr(self, "_fish_control_direction", 0) or 0)
+            if direction != previous:
+                self._fish_control_last_change = now
+                if direction:
+                    hold_time = self._normalize_ratio_config("control_min_hold_time", 0.12, 0.03, 0.35)
+                    self._fish_control_min_hold_until = now + hold_time
+                else:
+                    self._fish_control_min_hold_until = 0
+            self._fish_control_direction = direction
+
+            if direction > 0:
+                self.ctrl.key_up('A')
+                self.ctrl.key_down('D')
+            elif direction < 0:
+                self.ctrl.key_up('D')
+                self.ctrl.key_down('A')
+            else:
+                self.ctrl.release_all()
 
     def _default_ocr_root(self, package_name):
         appdata = os.environ.get("APPDATA")
@@ -949,13 +1506,14 @@ class StateMachine:
             (0.30, 0.60, 0.40, 0.16),
             (0.36, 0.64, 0.28, 0.12),
         ]
-        sample_offsets = [0.28, 0.46, 0.68, 0.92, 1.18]
+        sample_offsets = [0.0, 0.22, 0.46, 0.75, 1.05]
 
         elapsed = 0.0
         for target_offset in sample_offsets:
             sleep_for = max(0.0, target_offset - elapsed)
             if sleep_for > 0:
-                time.sleep(sleep_for)
+                if not self._sleep_interruptible(sleep_for):
+                    return fish_name or "未知鱼类", weight_g
             elapsed = target_offset
 
             if not fish_name:
@@ -1021,7 +1579,9 @@ class StateMachine:
         else:
             self._log(f"成功绑定游戏窗口。DPI倍率: {dpi_scale:.2f}")
         self.wm.set_foreground()
-        time.sleep(1) # 等待窗口置顶完成
+        if not self._sleep_interruptible(1): # 等待窗口置顶完成
+            self.sc.close()
+            return
         
         # ROI 定义 (相对于客户区宽高)
         # 缩小寻找 F 键的范围，只截取屏幕真正的右下角边缘，避免把中间的发光背景截进去
@@ -1050,14 +1610,16 @@ class StateMachine:
                 else:
                     self._log("警告: 游戏窗口失去焦点，暂停按键发送。")
                     self.ctrl.release_all()
-                    time.sleep(1)
+                    if not self._sleep_interruptible(1):
+                        break
                     continue
                 
             # 2. 获取实时窗口坐标 (防止窗口被拖动)
             rect = self.wm.get_client_rect()
             if not rect:
                 self._log("获取窗口坐标失败，请不要最小化游戏。")
-                time.sleep(1)
+                if not self._sleep_interruptible(1):
+                    break
                 continue
                 
             # 3. 状态分发
@@ -1071,70 +1633,58 @@ class StateMachine:
                 self._handle_result(rect)
             elif self.current_state == self.STATE_FAILED:
                 self._handle_failed()
+            elif self.current_state == self.STATE_RECOVERING:
+                self._handle_recovering(rect)
                 
             # 控制基础循环帧率
-            time.sleep(0.01)
+            if not self._sleep_interruptible(0.01, step=0.01):
+                break
             
         self.sc.close()
 
     def _handle_idle(self, rect, roi):
-        self._log("[待机] 正在检测右下角抛竿图标...")
-        
-        # 截取右下角 ROI
-        btn_img = self.sc.capture_relative(rect, *roi)
-        if btn_img is None: 
-            time.sleep(1)
+        if self._should_stop():
             return
+        self._log("[待机] 正在检测右下角抛竿图标...")
             
         # DEBUG 计数器
         if not hasattr(self, '_debug_count'): self._debug_count = 0
         self._debug_count += 1
-            
-        # 找图匹配
-        # 在待机状态下，利用 use_binary=True 强力二值化特征提取。
-        # 它可以无视白天水面的高亮背景，只对比纯白色图标本身，使得匹配成功率大幅提升。
-        # 此时阈值可以安全地设在 0.65 甚至更高，彻底防止将背景噪点当成 F 键。
-        loc, conf, matched_path = self.vis.find_best_template(
-            btn_img,
-            self._f_button_templates(),
-            threshold=0.60,
-            use_edge=False,
-            use_binary=True,
-            binary_threshold=145,
-            scale_range=self._template_scale_range(rect, 0.55, 1.65),
-            scale_steps=11,
-        )
+
+        ready_info = self._detect_ready_to_cast(rect, allow_heavy=(self._debug_count % 6 == 0))
+        if self._should_stop():
+            return
         
-        if loc:
-            matched_name = Path(matched_path).name if matched_path else "未知模板"
-            self._log(f"[待机] 识别到 F 键图标 (置信度: {conf:.2f}，模板: {matched_name})，坐标: {loc}。准备抛竿。")
-            self._log("[待机] > 正在向游戏发送 'F' 键点按指令 (150ms)...")
-            self.ctrl.key_tap('F', duration=0.15)
+        if ready_info and ready_info.get("location"):
+            if not self._send_cast_input(ready_info, "待机"):
+                return
+            if self._should_stop():
+                return
             cast_delay = max(1, min(int(self.config.get("cast_animation_delay", 2)), 5))
             self._log(f"[待机] > 发送完成，等待 {cast_delay} 秒抛竿动画...")
-            self._waiting_start_time = time.time()
             self.current_state = self.STATE_WAITING
-            time.sleep(cast_delay) # 抛竿动画较长，防抖
+            self._sleep_interruptible(cast_delay) # 抛竿动画较长，防抖
         else:
             if self._debug_count % 10 == 0 and self._debug_count <= 30:
-                cv2.imwrite("debug_f_btn_roi.png", btn_img)
+                btn_img = self.sc.capture_relative(rect, *roi)
+                if btn_img is not None:
+                    cv2.imwrite("debug_f_btn_roi.png", btn_img)
+                conf = ready_info.get("confidence") if ready_info else 0.0
                 self._log(f"[排错] 抛竿图标匹配失败，最高置信度: {conf:.2f}。已保存当前截图至根目录 debug_f_btn_roi.png")
-            time.sleep(0.5)
+            self._sleep_interruptible(0.5)
 
     def _handle_waiting(self, rect, roi):
         # 每隔一小段时间检测一次即可，不需要过高频率
-        time.sleep(0.1) 
+        if not self._sleep_interruptible(0.1):
+            return
+        if self._should_stop():
+            return
         if getattr(self, '_waiting_start_time', 0) == 0:
             self._waiting_start_time = time.time()
-        wait_timeout = max(20, min(int(self.config.get("hook_wait_timeout", 90)), 300))
-        if time.time() - self._waiting_start_time > wait_timeout:
-            self._log(f"[等待] 超过 {wait_timeout} 秒未识别到上钩提示，释放按键并回到待机重新检测。")
-            self.ctrl.release_all()
-            self._waiting_start_time = 0
-            self.current_state = self.STATE_IDLE
-            time.sleep(0.5)
-            return
-        
+        if getattr(self, '_last_cast_time', 0) == 0:
+            self._last_cast_time = self._waiting_start_time
+
+        now = time.time()
         text_img = self.sc.capture_relative(rect, *roi)
         if text_img is None: return
         
@@ -1154,22 +1704,54 @@ class StateMachine:
         if loc:
             matched_name = Path(matched_path).name if matched_path else "未知模板"
             self._log(f"[等待] 识别到上钩提示 (置信度: {conf:.2f}，模板: {matched_name})，迅速按F！")
-            self.ctrl.key_tap('F')
-            self.fishing_start_time = time.time()
+            if not self._tap_key_if_running('F'):
+                return
+            self._prepare_fishing_round_state(time.time())
             self._waiting_start_time = 0
+            self._last_cast_time = 0
+            self._waiting_recast_count = 0
+            self._waiting_ready_recheck_last = 0
             self.current_state = self.STATE_FISHING
             # 移除了硬编码的 1.5 秒 sleep，改为在 _handle_fishing 中动态等待耐力条出现，
             # 这样对于出现极快的稀有鱼可以做到零延迟响应。
+            return
+
+        wait_timeout = max(20, min(int(self.config.get("hook_wait_timeout", 90)), 300))
+        if now - self._waiting_start_time > wait_timeout:
+            self._log(f"[等待] 超过 {wait_timeout} 秒未识别到上钩提示，释放按键并回到待机重新检测。")
+            self._enter_recovering("抛竿后长时间未识别到上钩提示", record_empty=True, press_esc=True)
+            return
+
+        cast_retry_delay = max(6.0, min(float(self.config.get("cast_retry_delay", 8)), 30.0))
+        if now - self._last_cast_time >= cast_retry_delay and now - getattr(self, '_waiting_ready_recheck_last', 0) >= 1.0:
+            self._waiting_ready_recheck_last = now
+            ready_info = self._detect_ready_to_cast(
+                rect,
+                allow_heavy=(now - self._last_cast_time >= cast_retry_delay + 4.0),
+                require_initial_controls=False,
+                include_f=False,
+            )
+            if ready_info and ready_info.get("location"):
+                retry_count = int(getattr(self, '_waiting_recast_count', 0))
+                max_retries = 2
+                if retry_count < max_retries:
+                    self._waiting_recast_count = retry_count + 1
+                    self._log(f"[等待] 抛竿后仍检测到{ready_info.get('kind') or '钓鱼准备界面'}，判定可能未进入等待上钩流程，重试抛竿 ({self._waiting_recast_count}/{max_retries})。")
+                    if not self._send_cast_input(ready_info, "等待"):
+                        return
+                    self._sleep_interruptible(0.35)
+                    return
+                self._log("[等待] 多次重试后仍停留在钓鱼准备界面，进入恢复流程。")
+                self._enter_recovering("多次重发 F 后仍未进入抛竿流程", record_empty=False, press_esc=False)
+                return
 
 
     def _handle_fishing(self, rect, roi):
+        if self._should_stop():
+            return
         # 记录进入溜鱼状态的时间，用于防卡死
         if getattr(self, '_fishing_start_time', 0) == 0:
-            self._fishing_start_time = time.time()
-            self._last_cursor_x = None # 记录上一帧的游标位置，用于预测速度
-            self._seen_fishing_bar = False # 记录是否已经看到过耐力条
-            self._last_target_time = 0 # 每次抛竿重置测速时间戳
-            self._target_velocity = 0  # 每次抛竿重置测速历史
+            self._prepare_fishing_round_state(time.time())
             
         elapsed = time.time() - self._fishing_start_time
         if elapsed > self.fishing_timeout:
@@ -1178,14 +1760,54 @@ class StateMachine:
             self.current_state = self.STATE_RESULT
             return
 
+        if elapsed >= 1.0 and self._check_result_signals_during_fishing(rect, elapsed):
+            return
+
         # 截取耐力条 ROI
         bar_img = self.sc.capture_relative(rect, *roi)
         if bar_img is None: return
         
-        target_x, cursor_x, target_w, debug_img = self.vis.analyze_fishing_bar(bar_img)
+        target_x, cursor_x, target_w, debug_img, bar_confidence = self.vis.analyze_fishing_bar(
+            bar_img,
+            cursor_template_paths=self._cursor_templates(),
+            cursor_scale_range=self._template_scale_range(rect, 0.70, 1.55),
+            cursor_scale_steps=5,
+        )
+        target_x, cursor_x, target_w, bar_confidence = self._filter_bar_detection(
+            target_x,
+            cursor_x,
+            target_w,
+            bar_confidence,
+            bar_img.shape[1],
+        )
+        if (target_x is None or cursor_x is None) and not getattr(self, '_seen_fishing_bar', False):
+            fallback_roi = (0.25, 0.035, 0.50, 0.075)
+            fallback_img = self.sc.capture_relative(rect, *fallback_roi)
+            if fallback_img is not None:
+                fb_target_x, fb_cursor_x, fb_target_w, fb_debug_img, fb_confidence = self.vis.analyze_fishing_bar(
+                    fallback_img,
+                    cursor_template_paths=self._cursor_templates(),
+                    cursor_scale_range=self._template_scale_range(rect, 0.70, 1.55),
+                    cursor_scale_steps=5,
+                )
+                fb_target_x, fb_cursor_x, fb_target_w, fb_confidence = self._filter_bar_detection(
+                    fb_target_x,
+                    fb_cursor_x,
+                    fb_target_w,
+                    fb_confidence,
+                    fallback_img.shape[1],
+                )
+                if fb_target_x is not None and fb_cursor_x is not None:
+                    target_x, cursor_x, target_w, debug_img, bar_confidence = (
+                        fb_target_x,
+                        fb_cursor_x,
+                        fb_target_w,
+                        fb_debug_img,
+                        fb_confidence,
+                    )
         
         # 性能优化：限制 Debug 图像的发送频率（一秒最多 10 帧），防止撑爆队列导致主线程阻塞
-        if self.config.get("debug_mode", True) and debug_img is not None:
+        if self.config.get("debug_mode", False) and debug_img is not None:
             now = time.time()
             if getattr(self, '_last_debug_time', 0) == 0 or (now - self._last_debug_time) > 0.1:
                 if self.debug_queue and self.debug_queue.qsize() < 2:
@@ -1196,25 +1818,41 @@ class StateMachine:
         if target_x is None or cursor_x is None:
             # 安全保护：如果丢失目标，立刻释放所有按键，防止游标因为惯性飞出界
             self.ctrl.release_all()
+            self._fish_control_direction = 0
+            self._fish_control_min_hold_until = 0
             
-            if not getattr(self, '_seen_fishing_bar', False):
+            if not getattr(self, '_confirmed_fishing_bar', False):
+                last_seen_time = getattr(self, '_last_bar_seen_time', 0)
+                if last_seen_time and time.time() - last_seen_time > 0.55:
+                    self._bar_seen_streak = 0
+                    self._seen_fishing_bar = False
                 # 还没看到过耐力条，说明还在播放上钩的过渡动画
                 # 增加一个初始等待超时，比如 5 秒
-                if time.time() - self._fishing_start_time > 5.0:
+                transition_elapsed = time.time() - self._fishing_start_time
+                if transition_elapsed >= 1.0 and self._check_terminal_result_before_bar(rect, transition_elapsed):
+                    return
+                if transition_elapsed > 5.0:
                     self._log("[溜鱼] 长时间未检测到耐力条，进入结果判定...")
-                    self._fishing_start_time = 0
-                    self.current_state = self.STATE_RESULT
+                    self._enter_recovering("上钩后长时间未出现耐力条", record_empty=True, press_esc=True)
                 return
 
             # 引入容错：偶尔一帧没识别到不算结束，连续丢失超过用户设定才算结束
             if getattr(self, '_missing_start_time', 0) == 0:
                 self._missing_start_time = time.time()
-            missing_timeout = max(1, min(int(self.config.get("bar_missing_timeout", 2)), 5))
-            if time.time() - self._missing_start_time > missing_timeout:
+                self._result_quick_check_last = 0
+                self._result_full_check_last = self._missing_start_time
+
+            missing_elapsed = time.time() - self._missing_start_time
+            if missing_elapsed >= 0.12 and self._check_result_signals_after_bar_missing(rect, missing_elapsed):
+                return
+
+            missing_timeout = max(0.8, min(float(self.config.get("bar_missing_timeout", 2)), 5.0))
+            if missing_elapsed > missing_timeout:
                 self._log("[溜鱼] 耐力条消失，停止溜鱼，进入结果判定...")
                 self.ctrl.release_all()
                 self._fishing_start_time = 0
                 self._missing_start_time = 0
+                self._result_quick_check_last = 0
                 self._last_cursor_x = None
                 self._seen_fishing_bar = False
                 self._last_target_time = 0  # 重置测速时间戳
@@ -1224,7 +1862,23 @@ class StateMachine:
         
         # 识别到了，重置丢失计时器，并标记已经看到过耐力条
         self._missing_start_time = 0
+        self._result_quick_check_last = 0
+        self._result_full_check_last = 0
+        self._clear_result_ready_candidate()
+
+        now = time.time()
+        last_seen_time = getattr(self, '_last_bar_seen_time', 0)
+        if last_seen_time and now - last_seen_time <= 0.55:
+            self._bar_seen_streak = int(getattr(self, '_bar_seen_streak', 0)) + 1
+        else:
+            self._bar_seen_streak = 1
+            self._bar_first_seen_time = now
+        self._last_bar_seen_time = now
         self._seen_fishing_bar = True
+        if not getattr(self, '_confirmed_fishing_bar', False) and self._bar_seen_streak >= 2:
+            self._confirmed_fishing_bar = True
+            self._fishing_bar_confirmed_time = now
+        self._round_had_fishing_bar = bool(getattr(self, '_confirmed_fishing_bar', False))
 
         # === 核心追踪算法 (自适应非线性 PID + 前馈控制) ===
         error = target_x - cursor_x
@@ -1250,15 +1904,17 @@ class StateMachine:
             self._last_target_time = now
             self._target_velocity = target_velocity
             
-        # 动态安全区：根据绿条宽度计算 (比如绿条宽度的 20%)
-        safe_zone = target_w * 0.20 if target_w else 10
+        # 动态安全区：低级鱼竿容错更小，默认更积极追赶。
+        safe_zone_ratio = self._normalize_ratio_config("safe_zone_ratio", 0.10, 0.06, 0.28)
+        safe_zone = target_w * safe_zone_ratio if target_w else 8
         
         # PID 控制器计算基础偏差修正力
-        control_signal = self.pid.update(error)
+        tracking_strength = self._normalize_tracking_strength()
+        control_signal = self.pid.update(error) * tracking_strength
         
         # 引入前馈控制 (Feed-Forward)
         # 目标移动得越快，我们需要提前施加的同向“力”就越大
-        ff_gain = 0.15 # 前馈增益系数
+        ff_gain = self._normalize_ratio_config("feed_forward_gain", 0.24, 0.05, 0.50) * tracking_strength
         total_signal = control_signal + target_velocity * ff_gain
 
         # --- 纯非阻塞高频按键控制 ---
@@ -1266,96 +1922,559 @@ class StateMachine:
         # 如果游标在安全区内且目标没有高速移动，我们提高触发阈值，释放按键让游标自然滑动，避免左右鬼畜抽搐
         # 如果游标偏离或者目标正在高速逃离，我们降低阈值，要求立即按键追赶
         is_safe = (abs_error <= safe_zone) and (abs(target_velocity) < 80)
-        hold_threshold = max(6, min(int(self.config.get("t_hold", 15)), 60))
-        deadzone_threshold = max(1, min(int(self.config.get("t_deadzone", 5)), 30))
+        hold_threshold = max(2, min(int(self.config.get("t_hold", 5)), 60))
+        deadzone_threshold = max(1, min(int(self.config.get("t_deadzone", 1)), 30))
         threshold = hold_threshold if is_safe else deadzone_threshold
 
-        # 直接根据总信号方向进行按键映射，废弃阻塞线程的 key_tap(sleep)
-        if total_signal > threshold:
-            # 信号强力向右，需要按 D (同时松开 A 防止冲突)
-            self.ctrl.key_up('A')
-            self.ctrl.key_down('D')
-        elif total_signal < -threshold:
-            # 信号强力向左，需要按 A (同时松开 D 防止冲突)
-            self.ctrl.key_up('D')
-            self.ctrl.key_down('A')
-        else:
-            # 信号较小，处于完美跟随状态或需要刹车滑行，释放按键
-            self.ctrl.release_all()
+        direction = self._choose_fishing_control_direction(
+            error,
+            target_w,
+            target_velocity,
+            total_signal,
+            threshold,
+        )
+        self._apply_fishing_control_direction(direction)
+
+    def _detect_failed_result(self, rect):
+        failed_templates = self._failed_text_templates()
+        if not failed_templates:
+            return None
+
+        rois = (
+            (0.18, 0.38, 0.64, 0.22),
+            (0.20, 0.45, 0.60, 0.12),
+            (0.12, 0.32, 0.76, 0.34),
+        )
+        strategies = (
+            {"name": "failed-edge", "threshold": 0.48, "use_edge": True},
+            {"name": "failed-plain", "threshold": 0.58},
+        )
+        best = None
+        for roi in rois:
+            image = self.sc.capture_relative(rect, *roi)
+            if image is None:
+                continue
+            loc, conf, matched_path, strategy = self.vis.find_best_template_multi_strategy(
+                image,
+                failed_templates,
+                strategies,
+                threshold=0.56,
+                scale_range=self._template_scale_range(rect, 0.55, 1.75),
+                scale_steps=11,
+            )
+            if best is None or conf > best["confidence"]:
+                best = {"location": loc, "confidence": conf, "template": matched_path, "strategy": strategy, "roi": roi}
+            if loc is not None:
+                return best
+        return None
+
+    def _match_result_signal(self, rect, kind, templates, rois, strategies, threshold, low_factor, high_factor, scale_steps):
+        if not templates:
+            return None
+
+        best = None
+        for roi in rois:
+            image = self.sc.capture_relative(rect, *roi)
+            if image is None:
+                continue
+            loc, conf, matched_path, strategy = self.vis.find_best_template_multi_strategy(
+                image,
+                templates,
+                strategies,
+                threshold=threshold,
+                scale_range=self._template_scale_range(rect, low_factor, high_factor),
+                scale_steps=scale_steps,
+            )
+            if best is None or conf > best["confidence"]:
+                best = {
+                    "kind": kind,
+                    "location": loc,
+                    "confidence": conf,
+                    "template": matched_path,
+                    "strategy": strategy,
+                    "roi": roi,
+                }
+            if loc is not None:
+                return best
+
+        return None
+
+    def _build_success_result_info(self, success_signals):
+        best = max(success_signals, key=lambda item: item["confidence"])
+        return {
+            "location": best.get("location"),
+            "confidence": min(0.99, sum(item["confidence"] for item in success_signals) / len(success_signals)),
+            "template": best.get("template"),
+            "strategy": best.get("strategy"),
+            "signals": success_signals,
+        }
+
+    def _detect_fast_success_result(self, rect):
+        close_info = self._match_result_signal(
+            rect,
+            "点击关闭提示",
+            self._success_close_prompt_templates(),
+            (
+                (0.22, 0.76, 0.56, 0.20),
+            ),
+            (
+                {"name": "close-fast-edge", "threshold": 0.68, "use_edge": True},
+            ),
+            threshold=0.68,
+            low_factor=0.70,
+            high_factor=1.35,
+            scale_steps=5,
+        )
+        if not close_info or not close_info.get("location"):
+            return None
+
+        success_signals = [close_info]
+        weight_info = self._match_result_signal(
+            rect,
+            "重量单位 g",
+            self._weight_unit_templates(),
+            (
+                (0.33, 0.58, 0.34, 0.18),
+                (0.30, 0.56, 0.42, 0.22),
+            ),
+            (
+                {"name": "g-fast-plain", "threshold": 0.64},
+            ),
+            threshold=0.64,
+            low_factor=0.70,
+            high_factor=1.35,
+            scale_steps=5,
+        )
+        if weight_info and weight_info.get("location"):
+            success_signals.append(weight_info)
+            return self._build_success_result_info(success_signals)
+
+        exp_info = self._match_result_signal(
+            rect,
+            "获得钓鱼经验",
+            self._success_exp_templates(),
+            (
+                (0.24, 0.48, 0.52, 0.25),
+                (0.18, 0.42, 0.64, 0.32),
+            ),
+            (
+                {"name": "exp-fast-edge", "threshold": 0.58, "use_edge": True},
+            ),
+            threshold=0.58,
+            low_factor=0.70,
+            high_factor=1.35,
+            scale_steps=5,
+        )
+        if exp_info and exp_info.get("location"):
+            success_signals.append(exp_info)
+            return self._build_success_result_info(success_signals)
+
+        return None
+
+    def _detect_fast_failed_result(self, rect):
+        return self._match_result_signal(
+            rect,
+            "鱼儿溜走了",
+            self._failed_text_templates(),
+            (
+                (0.18, 0.38, 0.64, 0.22),
+            ),
+            (
+                {"name": "failed-fast-plain", "threshold": 0.62},
+            ),
+            threshold=0.62,
+            low_factor=0.70,
+            high_factor=1.35,
+            scale_steps=5,
+        )
+
+    def _detect_success_result(self, rect):
+        success_signals = []
+
+        weight_info = self._match_result_signal(
+            rect,
+            "重量单位 g",
+            self._weight_unit_templates(),
+            (
+                (0.30, 0.58, 0.42, 0.22),
+                (0.33, 0.60, 0.34, 0.18),
+                (0.36, 0.62, 0.28, 0.16),
+                (0.25, 0.54, 0.50, 0.30),
+            ),
+            (
+                {"name": "g-edge", "threshold": 0.50, "use_edge": True},
+                {"name": "g-plain", "threshold": 0.62},
+            ),
+            threshold=0.58,
+            low_factor=0.45,
+            high_factor=1.95,
+            scale_steps=13,
+        )
+        if weight_info and weight_info.get("location"):
+            success_signals.append(weight_info)
+
+        close_info = self._match_result_signal(
+            rect,
+            "点击关闭提示",
+            self._success_close_prompt_templates(),
+            (
+                (0.24, 0.76, 0.52, 0.20),
+                (0.20, 0.80, 0.60, 0.16),
+                (0.30, 0.82, 0.40, 0.14),
+            ),
+            (
+                {"name": "close-edge", "threshold": 0.50, "use_edge": True},
+                {"name": "close-plain", "threshold": 0.62},
+            ),
+            threshold=0.60,
+            low_factor=0.52,
+            high_factor=1.80,
+            scale_steps=11,
+        )
+        if close_info and close_info.get("location"):
+            success_signals.append(close_info)
+            if len(success_signals) >= 2:
+                return self._build_success_result_info(success_signals)
+
+        exp_info = self._match_result_signal(
+            rect,
+            "获得钓鱼经验",
+            self._success_exp_templates(),
+            (
+                (0.24, 0.48, 0.52, 0.30),
+                (0.30, 0.52, 0.40, 0.24),
+                (0.18, 0.42, 0.64, 0.38),
+            ),
+            (
+                {"name": "exp-edge", "threshold": 0.50, "use_edge": True},
+                {"name": "exp-plain", "threshold": 0.60},
+            ),
+            threshold=0.58,
+            low_factor=0.52,
+            high_factor=1.80,
+            scale_steps=11,
+        )
+        if exp_info and exp_info.get("location"):
+            success_signals.append(exp_info)
+
+        if len(success_signals) < 2:
+            return None
+
+        return self._build_success_result_info(success_signals)
+
+    def _format_success_signals(self, success_info):
+        parts = []
+        for item in (success_info or {}).get("signals", []):
+            matched_path = item.get("template")
+            matched_name = Path(matched_path).name if matched_path else "未知模板"
+            parts.append(f"{item.get('kind') or '成功特征'}:{item.get('confidence', 0):.2f}/{matched_name}/{item.get('strategy') or '默认'}")
+        return "；".join(parts) if parts else "无"
+
+    def _record_empty_result_once(self, reason):
+        if getattr(self, "_result_empty_recorded", False):
+            return
+        self.record_mgr.add_empty_catch()
+        self._result_empty_recorded = True
+        self._log(f"[结算] {reason}，已记录一次失败/空杆尝试。")
+
+    def _finish_fast_success_result(self, rect, success_info, source_label="溜鱼"):
+        self.ctrl.release_all()
+        self._finish_success_result(rect, success_info, attempt=1, max_attempts=1, source_label=source_label)
+
+    def _check_result_signals_during_fishing(self, rect, elapsed):
+        now = time.time()
+        interval = self._normalize_ratio_config("fishing_result_check_interval", 0.65, 0.35, 1.50)
+        if now - getattr(self, "_fishing_result_check_last", 0) < interval:
+            return False
+        self._fishing_result_check_last = now
+
+        success_info = self._detect_fast_success_result(rect)
+        if success_info and success_info.get("location"):
+            self._finish_fast_success_result(rect, success_info, source_label="溜鱼")
+            return True
+
+        failed_interval = self._normalize_ratio_config("fishing_failed_check_interval", 1.25, 0.70, 3.00)
+        if elapsed >= 1.5 and now - getattr(self, "_fishing_failed_check_last", 0) >= failed_interval:
+            self._fishing_failed_check_last = now
+            failed_info = self._detect_fast_failed_result(rect)
+            if failed_info and failed_info.get("location"):
+                self._finish_failed_result(failed_info, source_label="溜鱼")
+                return True
+
+        return False
+
+    def _check_terminal_result_before_bar(self, rect, elapsed):
+        now = time.time()
+        interval = 0.75 if elapsed < 3.0 else 0.45
+        if now - getattr(self, "_result_quick_check_last", 0) < interval:
+            return False
+        self._result_quick_check_last = now
+
+        success_info = self._detect_fast_success_result(rect)
+        if success_info and success_info.get("location"):
+            self._finish_fast_success_result(rect, success_info, source_label="溜鱼")
+            return True
+
+        if elapsed >= 2.0:
+            failed_info = self._detect_fast_failed_result(rect)
+            if failed_info and failed_info.get("location"):
+                self._finish_failed_result(failed_info, source_label="溜鱼")
+                return True
+
+        return False
+
+    def _finish_failed_result(self, failed_info, source_label="结算"):
+        matched_path = failed_info.get("template") if failed_info else None
+        matched_name = Path(matched_path).name if matched_path else "未知模板"
+        confidence = float((failed_info or {}).get("confidence") or 0.0)
+        strategy = (failed_info or {}).get("strategy") or "默认"
+        self._log(f"[{source_label}] 识别到“鱼儿溜走了”横幅 (置信度: {confidence:.2f}，模板: {matched_name}，策略: {strategy})！判定为钓鱼失败。")
+        self.ctrl.release_all()
+        self._enter_recovering("识别到鱼儿溜走失败提示", record_empty=True, press_esc=False)
+
+    def _finish_empty_ready_result(self, ready_info, source_label="结算"):
+        kind = (ready_info or {}).get("kind") or "可抛钩界面"
+        if getattr(self, "_round_had_fishing_bar", False):
+            self._record_empty_result_once(f"未检测到成功结算或失败横幅，但已回到{kind}，判定本轮失败/空杆")
+        self._log(f"[{source_label}] 已回到{kind}，直接进入待机。")
+        self._reset_round_state()
+        self.current_state = self.STATE_IDLE
+
+    def _save_empty_ready_debug(self, rect, ready_info, source_label):
+        if getattr(self, "_result_ready_debug_saved", False):
+            return
+        self._result_ready_debug_saved = True
+        if not self.config.get("debug_mode", False) or self.sc is None:
+            return
+        image = self.sc.capture_relative(rect, 0, 0, 1, 1)
+        if image is None or image.size <= 0:
+            return
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        path = f"debug_result_empty_ready_{timestamp}.png"
+        cv2.imwrite(path, image)
+        kind = (ready_info or {}).get("kind") or "可抛钩界面"
+        self._log(f"[排错] {source_label} 未识别到成功/失败但准备判定为空杆，已保存画面: {path}，检测到: {kind}")
+
+    def _clear_result_ready_candidate(self):
+        self._result_ready_seen_time = 0
+        self._result_ready_confirm_count = 0
+        self._result_ready_last_kind = ""
+
+    def _round_fishing_elapsed(self):
+        start_time = (
+            getattr(self, "_fishing_bar_confirmed_time", 0)
+            or getattr(self, "fishing_start_time", 0)
+            or getattr(self, "_fishing_start_time", 0)
+        )
+        if not start_time:
+            return 0.0
+        return max(0.0, time.time() - start_time)
+
+    def _confirm_empty_ready_result(self, rect, ready_info, source_label="结算"):
+        if not ready_info or not ready_info.get("location"):
+            return False
+
+        if not getattr(self, "_round_had_fishing_bar", False):
+            self._finish_empty_ready_result(ready_info, source_label=source_label)
+            return True
+
+        now = time.time()
+        kind = (ready_info or {}).get("kind") or "可抛钩界面"
+        if self._result_ready_last_kind != kind or getattr(self, "_result_ready_seen_time", 0) == 0:
+            self._result_ready_seen_time = now
+            self._result_ready_confirm_count = 1
+            self._result_ready_last_kind = kind
+            elapsed = self._round_fishing_elapsed()
+            self._log(f"[{source_label}] 本轮溜鱼耗时 {elapsed:.1f}s，已检测到{kind}；继续短暂确认成功/失败结算，避免误记空杆。")
+            return False
+
+        self._result_ready_confirm_count += 1
+        confirm_delay = self._normalize_ratio_config("empty_ready_confirm_delay", 0.9, 0.6, 3.0)
+        if now - self._result_ready_seen_time < confirm_delay or self._result_ready_confirm_count < 3:
+            return False
+
+        failed_info = self._detect_fast_failed_result(rect)
+        if failed_info and failed_info.get("location"):
+            self._finish_failed_result(failed_info, source_label=source_label)
+            return True
+
+        success_info = self._detect_fast_success_result(rect)
+        if success_info and success_info.get("location"):
+            self._finish_fast_success_result(rect, success_info, source_label=source_label)
+            return True
+
+        if getattr(self, "_round_had_fishing_bar", False):
+            last_full_check = getattr(self, "_result_full_check_last", 0)
+            if not last_full_check or now - last_full_check > 0.75:
+                return False
+
+        self._save_empty_ready_debug(rect, ready_info, source_label)
+        self._finish_empty_ready_result(ready_info, source_label=source_label)
+        return True
+
+    def _wait_after_settlement_close(self, rect, max_delay):
+        if getattr(self, "_stop_requested", False):
+            return False
+        deadline = time.time() + max_delay
+        if not self._sleep_interruptible(min(0.18, max_delay)):
+            return False
+        while time.time() < deadline:
+            if getattr(self, "_stop_requested", False):
+                return False
+            current_rect = self.wm.get_client_rect() or rect
+            ready_info = self._detect_cast_prompt_after_settlement(current_rect)
+            if ready_info and ready_info.get("location"):
+                self._log(f"[结算] 已检测到{ready_info.get('kind') or '可抛钩界面'}，提前进入下一轮。")
+                return True
+            if not self._sleep_interruptible(0.10):
+                return False
+        return False
+
+    def _finish_success_result(self, rect, success_info, attempt=1, max_attempts=1, source_label="结算"):
+        if getattr(self, "_stop_requested", False):
+            return
+        self._log(f"[{source_label}] 识别到成功结算组合特征 (综合置信度: {success_info['confidence']:.2f}，{self._format_success_signals(success_info)})，开始识别鱼类信息...")
+
+        fish_name, weight_g = self._read_settlement_info(rect)
+        if getattr(self, "_stop_requested", False):
+            return
+        self.record_mgr.add_catch(fish_name, weight_g)
+        if getattr(self, "_stop_requested", False):
+            return
+
+        self._log(f"[结算] 捕获: {fish_name}, 重量: {weight_g}g。尝试 ESC 关闭结算界面 (尝试 {attempt}/{max_attempts})...")
+        if not self._tap_key_if_running('esc', duration=0.15):
+            return
+        if getattr(self, "_stop_requested", False):
+            return
+
+        close_delay = max(0.4, min(float(self.config.get("settlement_close_delay", 1)), 5.0))
+        self._wait_after_settlement_close(rect, close_delay)
+        if getattr(self, "_stop_requested", False):
+            return
+        self.fish_count += 1
+        self._log(f"[结算] 成功关闭结算界面。当前累计钓获: {self.fish_count} 条。等待抛竿...")
+        self._reset_round_state()
+        self.current_state = self.STATE_IDLE
+
+    def _check_result_signals_after_bar_missing(self, rect, missing_elapsed):
+        now = time.time()
+        interval = 0.18 if missing_elapsed < 1.5 else 0.35
+        if now - getattr(self, "_result_quick_check_last", 0) < interval:
+            return False
+        self._result_quick_check_last = now
+
+        failed_info = self._detect_fast_failed_result(rect)
+        if failed_info and failed_info.get("location"):
+            self._finish_failed_result(failed_info, source_label="溜鱼")
+            return True
+
+        success_info = self._detect_fast_success_result(rect)
+        if success_info and success_info.get("location"):
+            self._finish_fast_success_result(rect, success_info, source_label="溜鱼")
+            return True
+
+        full_interval = 0.9 if missing_elapsed < 2.0 else 1.4
+        if now - getattr(self, "_result_full_check_last", 0) >= full_interval:
+            self._result_full_check_last = now
+            failed_info = self._detect_failed_result(rect)
+            if failed_info and failed_info.get("location"):
+                self._finish_failed_result(failed_info, source_label="溜鱼")
+                return True
+
+            success_info = self._detect_success_result(rect)
+            if success_info and success_info.get("location"):
+                self._finish_fast_success_result(rect, success_info, source_label="溜鱼")
+                return True
+
+        if missing_elapsed >= 0.30:
+            ready_info = self._detect_ready_to_cast(rect, allow_heavy=False, require_initial_controls=True)
+            if ready_info and ready_info.get("location"):
+                return self._confirm_empty_ready_result(rect, ready_info, source_label="溜鱼")
+            self._clear_result_ready_candidate()
+
+        return False
 
     def _handle_result(self, rect):
+        if self._should_stop():
+            return
         self._log("[结算] 正在检测钓鱼结果...")
-        
-        # 如果既没有成功特征，也没有明显的F键，我们还需要检查是不是“鱼儿溜走了”
-        # 鱼儿溜走了的特征：屏幕中央有一条黑色横幅，里面有白色文字
-        roi_failed_text = (0.2, 0.45, 0.6, 0.1)
-        
+
         max_attempts = 10 # 增加循环次数，但缩短每次的等待时间，实现更敏捷的响应
-        failed_templates = self._failed_text_templates()
-        
-        # 成功结算界面的最底部，有一行非常清晰的白色文字：“点击空白区域关闭”
-        # 我们截取屏幕底部的这块区域，通过分析其亮度（是否存在大量白色像素）来判断是否处于成功界面
-        roi_bottom_text = (0.3, 0.85, 0.4, 0.1)
 
         for attempt in range(max_attempts):
-            # 1. 优先检测中央的“鱼儿溜走了”横幅 (唯一失败判定标准)
-            failed_img = self.sc.capture_relative(rect, *roi_failed_text)
-            if failed_img is not None:
-                # 使用真实的资产图片进行特征匹配，彻底解决误判
-                # 鱼儿溜走了是白底黑字，可以直接使用二值化来排除背景光照干扰
-                loc_fail, conf_fail, matched_path = self.vis.find_best_template(
-                    failed_img,
-                    failed_templates,
-                    threshold=0.60,
-                    use_edge=False,
-                    use_binary=True,
-                    binary_threshold=145,
-                    scale_range=self._template_scale_range(rect, 0.62, 1.55),
-                    scale_steps=11,
-                )
-                if loc_fail:
-                    matched_name = Path(matched_path).name if matched_path else "未知模板"
-                    self._log(f"[结算] 识别到“鱼儿溜走了”横幅 (置信度: {conf_fail:.2f}，模板: {matched_name})！判定为钓鱼失败，已自动重置。")
-                    self.current_state = self.STATE_IDLE
-                    return
+            full_checked_at = time.time()
+            failed_info = self._detect_failed_result(rect)
+            if failed_info and failed_info.get("location"):
+                self._finish_failed_result(failed_info)
+                return
 
-            # 2. 检测是否成功（底部出现了“点击空白区域关闭”之类的白色高亮文本）
-            bottom_img = self.sc.capture_relative(rect, *roi_bottom_text)
-            if bottom_img is not None:
-                # 简单粗暴且高效的亮度检测：将图像转为灰度，统计亮度大于 200 的纯白像素数量
-                gray = cv2.cvtColor(bottom_img, cv2.COLOR_BGR2GRAY)
-                white_pixels = cv2.countNonZero(cv2.inRange(gray, 200, 255))
-                
-                # 如果底部有大量高亮文字，说明真的是成功结算界面了
-                if white_pixels > 150:
-                    self._log("[结算] 识别到结算文字特征，判定为钓鱼成功！正在识别鱼类信息...")
+            success_info = self._detect_success_result(rect)
+            if success_info and success_info.get("location"):
+                self._finish_success_result(rect, success_info, attempt=attempt + 1, max_attempts=max_attempts)
+                return
+            self._result_full_check_last = full_checked_at
 
-                    fish_name, weight_g = self._read_settlement_info(rect)
-                    self.record_mgr.add_catch(fish_name, weight_g)
-                    
-                    self._log(f"[结算] 捕获: {fish_name}, 重量: {weight_g}g。尝试 ESC 关闭结算界面 (尝试 {attempt+1}/{max_attempts})...")
-                    
-                    # 仅使用 ESC 关闭
-                    self.ctrl.key_tap('esc', duration=0.15)
-                    
-                    close_delay = max(1, min(int(self.config.get("settlement_close_delay", 2)), 5))
-                    time.sleep(close_delay) # 每次操作后多等一会，给动画留足时间
-                    self.fish_count += 1
-                    self._log(f"[结算] 成功关闭结算界面。当前累计钓获: {self.fish_count} 条。等待抛竿...")
-                    self.current_state = self.STATE_IDLE
+            ready_info = self._detect_ready_to_cast(rect, allow_heavy=False, require_initial_controls=True)
+            if ready_info and ready_info.get("location"):
+                if self._confirm_empty_ready_result(rect, ready_info):
                     return
+            else:
+                self._clear_result_ready_candidate()
                     
             # 如果既没有 F 键，也没有底部文字，说明可能还在播放动画，稍微等一下继续循环
-            time.sleep(0.5)
+            if not self._sleep_interruptible(0.25):
+                return
 
         # 如果试了多次还是不行，就强行重置，避免脚本卡死在这个状态
         self._log("[警告] 结算超时，强制返回待机状态。")
-        self.current_state = self.STATE_IDLE
+        self._enter_recovering("结算判定超时", record_empty=False, press_esc=True)
+
+    def _handle_recovering(self, rect):
+        if self._should_stop():
+            return
+        if getattr(self, "_recovery_start_time", 0) == 0:
+            self._recovery_start_time = time.time()
+
+        now = time.time()
+        elapsed = now - self._recovery_start_time
+
+        if getattr(self, "_recovery_esc_requested", False) and not getattr(self, "_recovery_esc_sent", False):
+            self.ctrl.release_all()
+            if not self._tap_key_if_running('esc', duration=0.15):
+                return
+            self._recovery_esc_sent = True
+            self._sleep_interruptible(0.35)
+            return
+
+        ready_info = self._detect_ready_to_cast(rect, allow_heavy=(elapsed >= 2.0), require_initial_controls=True)
+        if ready_info and ready_info.get("location"):
+            self._log(f"[恢复] 已检测到{ready_info.get('kind') or '可抛钩提示'}，恢复到待机流程。")
+            self._reset_round_state()
+            self.current_state = self.STATE_IDLE
+            return
+
+        if getattr(self, "_recovery_esc_requested", False) and elapsed >= 3.0 and not getattr(self, "_recovery_second_esc_sent", False):
+            self._log("[恢复] 暂未看到可抛钩提示，执行一次轻量 ESC 复位。")
+            self.ctrl.release_all()
+            if not self._tap_key_if_running('esc', duration=0.12):
+                return
+            self._recovery_second_esc_sent = True
+            self._sleep_interruptible(0.35)
+            return
+
+        recovery_timeout = max(4, min(int(self.config.get("recovery_timeout", 8)), 20))
+        if elapsed > recovery_timeout:
+            reason = getattr(self, "_recovery_reason", "未知异常")
+            self._log(f"[恢复] {reason} 后 {recovery_timeout} 秒仍未确认可抛钩界面，退回待机继续扫描；如画面已被用户接管，请手动停止脚本。")
+            self._reset_round_state()
+            self.current_state = self.STATE_IDLE
+            return
+
+        self._sleep_interruptible(0.2)
 
     def _handle_failed(self):
         # 注意: 这里的“溜走了”如果用户提供了图片，建议也走 find_template
         # 目前暂时作为占位或使用超时跳出
         self._log("[失败/结束] 释放按键，等待复位。")
-        self.ctrl.release_all()
-        time.sleep(1.5)
-        self.current_state = self.STATE_IDLE
+        self._enter_recovering("进入失败兜底状态", record_empty=True, press_esc=False)
