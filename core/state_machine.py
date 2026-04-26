@@ -760,11 +760,10 @@ class StateMachine:
         target_x, cursor_x, target_w, debug_img, confidence = self.vis.analyze_fishing_bar(
             bar_img,
             cursor_template_paths=self._cursor_templates_for_current_frame(),
-            target_template_paths=self._target_bar_templates(),
+            cursor_color_reference_paths=self._cursor_templates(),
+            target_color_reference_paths=self._target_bar_templates(),
             cursor_scale_range=self._template_scale_range(rect, 0.70, 1.55),
             cursor_scale_steps=5,
-            target_scale_range=self._template_scale_range(rect, 0.70, 1.30),
-            target_scale_steps=3,
             draw_debug=draw_debug,
         )
         target_x, cursor_x = self._bar_local_to_client_x(rect, roi, target_x, cursor_x)

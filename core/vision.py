@@ -281,15 +281,147 @@ class VisionCore:
             return best_pass[0], best_pass[1], best_pass[2], best_pass[3]
         return None, best_raw[1], best_raw[2], best_raw[3]
 
+    def _target_color_profile(self, reference_paths):
+        paths = tuple(os.fspath(path) for path in (reference_paths or ()) if path)
+        cache_key = ("target-color-profile", paths)
+        if cache_key in self._processed_template_cache:
+            return self._processed_template_cache[cache_key]
+
+        samples = []
+        for path in paths:
+            template = self._read_template(path)
+            if template is None or template.size == 0:
+                continue
+            if len(template.shape) == 3 and template.shape[2] == 4:
+                alpha_mask = template[:, :, 3] > 20
+                bgr = template[:, :, :3]
+            else:
+                alpha_mask = None
+                bgr = template[:, :, :3] if len(template.shape) == 3 else cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+
+            hsv_ref = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            valid = (hsv_ref[:, :, 1] >= 70) & (hsv_ref[:, :, 2] >= 70)
+            if alpha_mask is not None:
+                valid &= alpha_mask
+            if np.count_nonzero(valid) < 12:
+                continue
+            samples.append(hsv_ref[valid])
+
+        if samples:
+            values = np.concatenate(samples, axis=0)
+            hue = values[:, 0]
+            sat = values[:, 1]
+            val = values[:, 2]
+            h_low = int(max(0, np.percentile(hue, 1) - 4))
+            h_high = int(min(179, np.percentile(hue, 99) + 6))
+            s_low = int(max(145, np.percentile(sat, 10) - 18))
+            v_low = int(max(96, np.percentile(val, 5) - 38))
+            profile = {
+                "strict": (h_low, h_high, s_low, v_low),
+                "relaxed": (
+                    max(0, h_low - 4),
+                    min(179, h_high + 5),
+                    max(122, s_low - 20),
+                    max(78, v_low - 24),
+                ),
+            }
+        else:
+            profile = {
+                "strict": (78, 109, 145, 96),
+                "relaxed": (74, 114, 122, 78),
+            }
+
+        self._processed_template_cache[cache_key] = profile
+        return profile
+
+    def _target_reference_mask(self, hsv, reference_paths, relaxed=False):
+        if hsv is None:
+            return None
+        profile = self._target_color_profile(reference_paths)
+        h_low, h_high, s_low, v_low = profile["relaxed" if relaxed else "strict"]
+        lower = np.array([h_low, s_low, v_low], dtype=np.uint8)
+        upper = np.array([h_high, 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower, upper)
+
+    def _cursor_color_profile(self, reference_paths):
+        paths = tuple(os.fspath(path) for path in (reference_paths or ()) if path)
+        cache_key = ("cursor-color-profile", paths)
+        if cache_key in self._processed_template_cache:
+            return self._processed_template_cache[cache_key]
+
+        samples = []
+        for path in paths:
+            template = self._read_template(path)
+            if template is None or template.size == 0:
+                continue
+            if len(template.shape) == 3 and template.shape[2] == 4:
+                alpha_mask = template[:, :, 3] > 20
+                bgr = template[:, :, :3]
+            else:
+                alpha_mask = None
+                bgr = template[:, :, :3] if len(template.shape) == 3 else cv2.cvtColor(template, cv2.COLOR_GRAY2BGR)
+
+            hsv_ref = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+            valid = (
+                (hsv_ref[:, :, 0] >= 12)
+                & (hsv_ref[:, :, 0] <= 45)
+                & (hsv_ref[:, :, 1] >= 70)
+                & (hsv_ref[:, :, 2] >= 110)
+            )
+            if alpha_mask is not None:
+                valid &= alpha_mask
+            if np.count_nonzero(valid) < 8:
+                continue
+            samples.append(hsv_ref[valid])
+
+        if samples:
+            values = np.concatenate(samples, axis=0)
+            hue = values[:, 0]
+            sat = values[:, 1]
+            val = values[:, 2]
+            h_low = int(max(0, np.percentile(hue, 1) - 4))
+            h_high = int(min(179, np.percentile(hue, 99) + 4))
+            s_low = int(max(72, np.percentile(sat, 5) - 22))
+            v_low = int(max(104, np.percentile(val, 1) - 18))
+            profile = {
+                "strict": (h_low, h_high, s_low, v_low),
+                "relaxed": (
+                    max(0, h_low - 3),
+                    min(179, h_high + 3),
+                    max(60, s_low - 16),
+                    max(88, v_low - 18),
+                ),
+            }
+        else:
+            profile = {
+                "strict": (18, 35, 72, 104),
+                "relaxed": (15, 38, 60, 88),
+            }
+
+        self._processed_template_cache[cache_key] = profile
+        return profile
+
+    def _cursor_reference_mask(self, hsv, reference_paths, relaxed=False):
+        if hsv is None or not reference_paths:
+            return None
+        profile = self._cursor_color_profile(reference_paths)
+        h_low, h_high, s_low, v_low = profile["relaxed" if relaxed else "strict"]
+        lower = np.array([h_low, s_low, v_low], dtype=np.uint8)
+        upper = np.array([h_high, 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower, upper)
+
     def analyze_fishing_bar(
         self,
         roi_img,
         cursor_template_paths=None,
+        cursor_color_reference_paths=None,
         target_template_paths=None,
+        target_color_reference_paths=None,
         cursor_scale_range=None,
         cursor_scale_steps=5,
         target_scale_range=None,
         target_scale_steps=5,
+        allow_target_template=False,
         draw_debug=True,
     ):
         """
@@ -304,31 +436,54 @@ class VisionCore:
         roi_h, roi_w = roi_img.shape[:2]
         hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
 
-        yellow_cfg = self.hsv_config.get("yellow", {})
-        lower_yellow = np.array(yellow_cfg.get("min", [15, 80, 130]), dtype=np.uint8)
-        upper_yellow = np.array(yellow_cfg.get("max", [45, 255, 255]), dtype=np.uint8)
-        lower_yellow = np.minimum(lower_yellow, np.array([15, 80, 130], dtype=np.uint8))
-        upper_yellow = np.maximum(upper_yellow, np.array([45, 255, 255], dtype=np.uint8))
-        cursor_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+        reference_paths = target_color_reference_paths if target_color_reference_paths is not None else target_template_paths
+        has_reference_color = bool(reference_paths)
+        cursor_reference_paths = cursor_color_reference_paths if cursor_color_reference_paths is not None else cursor_template_paths
+        target_mask = None
+        initial_target = None
+        if has_reference_color:
+            green_candidates = []
+            initial_reference_mask = self._target_reference_mask(hsv, reference_paths, relaxed=False)
+            if initial_reference_mask is not None and cv2.countNonZero(initial_reference_mask) >= max(8, int(roi_w * roi_h * 0.00020)):
+                initial_reference_mask = cv2.morphologyEx(initial_reference_mask, cv2.MORPH_CLOSE, np.ones((3, max(3, int(roi_w * 0.008))), np.uint8))
+                initial_reference_mask = cv2.morphologyEx(initial_reference_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                initial_target = self._select_reference_color_bar_component(
+                    initial_reference_mask,
+                    {"cy": roi_h * 0.5},
+                    roi_w,
+                    roi_h,
+                    hsv=hsv,
+                )
+                if initial_target is not None:
+                    green_candidates = [initial_target]
+        else:
+            green_cfg = self.hsv_config.get("green", {})
+            lower_green = np.array(green_cfg.get("min", [35, 45, 45]), dtype=np.uint8)
+            upper_green = np.array(green_cfg.get("max", [95, 255, 255]), dtype=np.uint8)
+            lower_green = np.maximum(lower_green, np.array([35, 45, 70], dtype=np.uint8))
+            upper_green = np.maximum(upper_green, np.array([95, 255, 255], dtype=np.uint8))
+            target_mask = cv2.inRange(hsv, lower_green, upper_green)
 
-        green_cfg = self.hsv_config.get("green", {})
-        lower_green = np.array(green_cfg.get("min", [35, 45, 45]), dtype=np.uint8)
-        upper_green = np.array(green_cfg.get("max", [95, 255, 255]), dtype=np.uint8)
-        lower_green = np.maximum(lower_green, np.array([35, 45, 70], dtype=np.uint8))
-        upper_green = np.maximum(upper_green, np.array([95, 255, 255], dtype=np.uint8))
-        target_mask = cv2.inRange(hsv, lower_green, upper_green)
+            green_probe_mask = target_mask.copy()
+            probe_values = hsv[:, :, 2][green_probe_mask > 0]
+            if probe_values.size:
+                probe_v_floor = max(int(lower_green[2]), min(155, int(np.percentile(probe_values, 65)) + 6))
+                refined_probe = green_probe_mask.copy()
+                refined_probe[hsv[:, :, 2] < probe_v_floor] = 0
+                if cv2.countNonZero(refined_probe) >= max(8, int(roi_w * roi_h * 0.0004)):
+                    green_probe_mask = refined_probe
+            green_probe_mask = cv2.morphologyEx(green_probe_mask, cv2.MORPH_CLOSE, np.ones((3, max(7, int(roi_w * 0.025))), np.uint8))
+            green_probe_mask = cv2.morphologyEx(green_probe_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+            green_candidates = self._collect_green_bar_candidates(green_probe_mask, roi_w, roi_h)
 
-        green_probe_mask = target_mask.copy()
-        probe_values = hsv[:, :, 2][green_probe_mask > 0]
-        if probe_values.size:
-            probe_v_floor = max(int(lower_green[2]), min(155, int(np.percentile(probe_values, 65)) + 6))
-            refined_probe = green_probe_mask.copy()
-            refined_probe[hsv[:, :, 2] < probe_v_floor] = 0
-            if cv2.countNonZero(refined_probe) >= max(8, int(roi_w * roi_h * 0.0004)):
-                green_probe_mask = refined_probe
-        green_probe_mask = cv2.morphologyEx(green_probe_mask, cv2.MORPH_CLOSE, np.ones((3, max(7, int(roi_w * 0.025))), np.uint8))
-        green_probe_mask = cv2.morphologyEx(green_probe_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
-        green_candidates = self._collect_green_bar_candidates(green_probe_mask, roi_w, roi_h)
+        cursor_mask = self._cursor_reference_mask(hsv, cursor_reference_paths, relaxed=False)
+        if cursor_mask is None or cv2.countNonZero(cursor_mask) < max(4, int(roi_w * roi_h * 0.00010)):
+            yellow_cfg = self.hsv_config.get("yellow", {})
+            lower_yellow = np.array(yellow_cfg.get("min", [15, 80, 130]), dtype=np.uint8)
+            upper_yellow = np.array(yellow_cfg.get("max", [45, 255, 255]), dtype=np.uint8)
+            lower_yellow = np.minimum(lower_yellow, np.array([15, 80, 130], dtype=np.uint8))
+            upper_yellow = np.maximum(upper_yellow, np.array([45, 255, 255], dtype=np.uint8))
+            cursor_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
         cursor_kernel = np.ones((3, 3), np.uint8)
         cursor_mask = cv2.morphologyEx(cursor_mask, cv2.MORPH_OPEN, cursor_kernel)
@@ -358,49 +513,84 @@ class VisionCore:
         band_y1 = max(0, int(cursor["cy"]) - band_half)
         band_y2 = min(roi_h, int(cursor["cy"]) + band_half + 1)
 
-        band_mask = np.zeros_like(target_mask)
-        band_mask[band_y1:band_y2, :] = target_mask[band_y1:band_y2, :]
-        relaxed_band_mask = band_mask.copy()
-        band_values = hsv[band_y1:band_y2, :, 2][band_mask[band_y1:band_y2, :] > 0]
-        if band_values.size:
-            adaptive_v_floor = max(int(lower_green[2]), min(155, int(np.percentile(band_values, 65)) + 6))
-            refined_band_mask = band_mask.copy()
-            refined_band_mask[hsv[:, :, 2] < adaptive_v_floor] = 0
-            if cv2.countNonZero(refined_band_mask[band_y1:band_y2, :]) >= max(8, int(roi_w * roi_h * 0.0004)):
-                band_mask = refined_band_mask
-        close_w = max(5, int(roi_w * 0.018))
-        band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, close_w), np.uint8))
-        band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+        target = None
+        if has_reference_color:
+            reference_mask = self._target_reference_mask(hsv, reference_paths, relaxed=False)
+            if reference_mask is not None:
+                reference_band_mask = np.zeros_like(reference_mask)
+                reference_band_mask[band_y1:band_y2, :] = reference_mask[band_y1:band_y2, :]
+                if cv2.countNonZero(reference_band_mask[band_y1:band_y2, :]) >= max(8, int(roi_w * roi_h * 0.00020)):
+                    ref_close_w = max(3, int(roi_w * 0.008))
+                    reference_band_mask = cv2.morphologyEx(reference_band_mask, cv2.MORPH_CLOSE, np.ones((3, ref_close_w), np.uint8))
+                    reference_band_mask = cv2.morphologyEx(reference_band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                    target = self._select_horizontal_run_green_bar(reference_band_mask, cursor, roi_w, roi_h, hsv=hsv)
+                    if target is None:
+                        target = self._select_reference_color_bar_component(reference_band_mask, cursor, roi_w, roi_h, hsv=hsv)
 
-        target = self._select_green_bar_component(band_mask, roi_w, roi_h, band_y1, band_y2, cursor, hsv=hsv)
-        if target is None:
-            target = self._select_split_green_bar_near_cursor(band_mask, cursor, roi_w, roi_h, hsv=hsv)
-        if target is None:
-            relaxed_close_w = max(5, int(roi_w * 0.020))
-            relaxed_band_mask = cv2.morphologyEx(relaxed_band_mask, cv2.MORPH_CLOSE, np.ones((3, relaxed_close_w), np.uint8))
-            relaxed_band_mask = cv2.morphologyEx(relaxed_band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
-            target = self._select_green_bar_component(
-                relaxed_band_mask,
-                roi_w,
-                roi_h,
-                band_y1,
-                band_y2,
-                cursor,
-                hsv=hsv,
-                relaxed=True,
-            )
             if target is None:
-                target = self._select_split_green_bar_near_cursor(
+                relaxed_reference_mask = self._target_reference_mask(hsv, reference_paths, relaxed=True)
+                if relaxed_reference_mask is not None:
+                    relaxed_reference_band_mask = np.zeros_like(relaxed_reference_mask)
+                    relaxed_reference_band_mask[band_y1:band_y2, :] = relaxed_reference_mask[band_y1:band_y2, :]
+                    if cv2.countNonZero(relaxed_reference_band_mask[band_y1:band_y2, :]) >= max(8, int(roi_w * roi_h * 0.00020)):
+                        relaxed_ref_close_w = max(3, int(roi_w * 0.010))
+                        relaxed_reference_band_mask = cv2.morphologyEx(relaxed_reference_band_mask, cv2.MORPH_CLOSE, np.ones((3, relaxed_ref_close_w), np.uint8))
+                        relaxed_reference_band_mask = cv2.morphologyEx(relaxed_reference_band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                        target = self._select_reference_color_bar_component(
+                            relaxed_reference_band_mask,
+                            cursor,
+                            roi_w,
+                            roi_h,
+                            hsv=hsv,
+                            relaxed=True,
+                        )
+        if target is None and initial_target is not None:
+            target = initial_target
+
+        if target is None and not has_reference_color:
+            band_mask = np.zeros_like(target_mask)
+            band_mask[band_y1:band_y2, :] = target_mask[band_y1:band_y2, :]
+            relaxed_band_mask = band_mask.copy()
+            band_values = hsv[band_y1:band_y2, :, 2][band_mask[band_y1:band_y2, :] > 0]
+            if band_values.size:
+                adaptive_v_floor = max(int(lower_green[2]), min(155, int(np.percentile(band_values, 65)) + 6))
+                refined_band_mask = band_mask.copy()
+                refined_band_mask[hsv[:, :, 2] < adaptive_v_floor] = 0
+                if cv2.countNonZero(refined_band_mask[band_y1:band_y2, :]) >= max(8, int(roi_w * roi_h * 0.0004)):
+                    band_mask = refined_band_mask
+            close_w = max(5, int(roi_w * 0.018))
+            band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, close_w), np.uint8))
+            band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+
+            target = self._select_green_bar_component(band_mask, roi_w, roi_h, band_y1, band_y2, cursor, hsv=hsv)
+            if target is None:
+                target = self._select_split_green_bar_near_cursor(band_mask, cursor, roi_w, roi_h, hsv=hsv)
+            if target is None:
+                relaxed_close_w = max(5, int(roi_w * 0.020))
+                relaxed_band_mask = cv2.morphologyEx(relaxed_band_mask, cv2.MORPH_CLOSE, np.ones((3, relaxed_close_w), np.uint8))
+                relaxed_band_mask = cv2.morphologyEx(relaxed_band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                target = self._select_green_bar_component(
                     relaxed_band_mask,
-                    cursor,
                     roi_w,
                     roi_h,
+                    band_y1,
+                    band_y2,
+                    cursor,
                     hsv=hsv,
                     relaxed=True,
                 )
-        if target is None:
-            target = self._select_green_candidate_near_cursor(green_candidates, cursor, roi_w, roi_h, hsv=hsv)
-        if target is None and target_template_paths:
+                if target is None:
+                    target = self._select_split_green_bar_near_cursor(
+                        relaxed_band_mask,
+                        cursor,
+                        roi_w,
+                        roi_h,
+                        hsv=hsv,
+                        relaxed=True,
+                    )
+            if target is None:
+                target = self._select_green_candidate_near_cursor(green_candidates, cursor, roi_w, roi_h, hsv=hsv)
+        if target is None and allow_target_template and target_template_paths:
             target = self._target_bar_template_candidate(
                 roi_img,
                 target_template_paths or (),
@@ -679,9 +869,17 @@ class VisionCore:
                     y_score = 1.0 - min(1.0, abs(cy - green["cy"]) / max(2.0, roi_h * 0.16, h * 0.9))
                     expected_h = max(4.0, green["h"] * 2.8)
                     height_score = 1.0 - min(1.0, abs(h - expected_h) / max(3.0, expected_h * 1.10))
-                    green_scores.append(y_score * 0.72 + height_score * 0.28)
+                    margin = max(roi_w * 0.10, green["w"] * 0.75, 24.0)
+                    left = float(green["x"]) - margin
+                    right = float(green["x"] + green["w"]) + margin
+                    if left <= cx <= right:
+                        x_score = 1.0
+                    else:
+                        distance = left - cx if cx < left else cx - right
+                        x_score = 1.0 - min(1.0, distance / max(8.0, margin * 0.80))
+                    green_scores.append(y_score * 0.56 + height_score * 0.18 + x_score * 0.26)
                 band_score = max(0.0, max(green_scores))
-                if band_score < 0.18 and candidate.get("source") != "template":
+                if band_score < 0.36 and candidate.get("source") != "template":
                     continue
 
             template_bonus = 0.18 if candidate.get("source") == "template" else 0.0
@@ -758,6 +956,66 @@ class VisionCore:
         sat_score = min(1.0, max(0.0, (float(np.mean(sat)) - 45.0) / 120.0))
         val_score = min(1.0, max(0.0, (float(np.mean(val)) - 75.0) / 115.0))
         return max(0.0, min(1.0, cyan_ratio * 0.42 + core_ratio * 0.32 + sat_score * 0.14 + val_score * 0.12))
+
+    def _select_reference_color_bar_component(self, mask, cursor, roi_w, roi_h, hsv=None, relaxed=False):
+        if mask is None or cursor is None:
+            return None
+
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+        best = None
+        cursor_cy = float(cursor.get("cy", roi_h * 0.5))
+        min_width = max(36 if relaxed else 48, int(roi_w * (0.075 if relaxed else 0.095)))
+        max_width = max(min_width + 1, int(roi_w * (0.44 if relaxed else 0.39)))
+        max_height = max(6, int(roi_h * (0.92 if relaxed else 0.88)))
+        max_y_delta = max(5.0 if relaxed else 4.0, roi_h * (0.18 if relaxed else 0.14))
+
+        for index in range(1, count):
+            x, y, w, h, area = stats[index]
+            if area < max(8, int(roi_w * roi_h * 0.00028)):
+                continue
+            if w < min_width or w > max_width or h < 2 or h > max_height:
+                continue
+            if x <= 1 and x + w >= roi_w - 2:
+                continue
+            aspect = w / max(1, h)
+            if aspect < (2.0 if relaxed else 2.6):
+                continue
+            fill_ratio = area / max(1, w * h)
+            if fill_ratio < (0.10 if relaxed else 0.14):
+                continue
+
+            cx, cy = centroids[index]
+            y_delta = abs(float(cy) - cursor_cy)
+            if y_delta > max_y_delta:
+                continue
+
+            color_quality = self._bar_color_quality(hsv, x, y, w, h)
+            if color_quality < (0.42 if relaxed else 0.50):
+                continue
+
+            width_score = min(1.0, w / max(1.0, roi_w * 0.18))
+            y_score = 1.0 - min(1.0, y_delta / max(1.0, roi_h * 0.35))
+            fill_score = min(1.0, fill_ratio / 0.42)
+            height_score = 1.0 - min(1.0, max(0.0, h - roi_h * 0.52) / max(1.0, roi_h * 0.20))
+            confidence = color_quality * 0.36 + width_score * 0.25 + y_score * 0.21 + fill_score * 0.10 + height_score * 0.08
+            score = confidence + width_score * 0.08 + color_quality * 0.08
+
+            if best is None or score > best["score"]:
+                best = {
+                    "x": int(x),
+                    "y": int(y),
+                    "w": int(w),
+                    "h": int(h),
+                    "area": int(area),
+                    "cx": float(cx),
+                    "cy": float(cy),
+                    "confidence": max(0.0, min(0.92, confidence)),
+                    "score": max(0.0, min(1.08, score)),
+                    "track_score": max(0.0, min(1.0, color_quality)),
+                    "source": "reference-color",
+                }
+
+        return best
 
     def _select_horizontal_run_green_bar(self, mask, cursor, roi_w, roi_h, hsv=None, relaxed=False):
         if hsv is None or mask is None or cursor is None:
