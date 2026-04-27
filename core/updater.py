@@ -34,6 +34,10 @@ class NoPublishedRelease(UpdateError):
     pass
 
 
+class ManifestUnavailable(UpdateError):
+    pass
+
+
 @dataclass
 class UpdateInfo:
     version: str
@@ -68,32 +72,49 @@ def is_newer_version(remote_version, current_version=APP_VERSION):
     return parse_version(remote_version) > parse_version(current_version)
 
 
-def _request(url, timeout=8):
+def _request(url, timeout=8, api=False):
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": USER_AGENT,
+    }
+    if api:
+        headers.update(
+            {
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+        )
     request = urllib.request.Request(
         url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": USER_AGENT,
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
+        headers=headers,
     )
     return urllib.request.urlopen(request, timeout=timeout)
 
 
-def _load_json(url, timeout=8):
+def _load_json(url, timeout=8, label="GitHub Release 信息", api=False):
     try:
-        with _request(url, timeout=timeout) as response:
+        with _request(url, timeout=timeout, api=api) as response:
             charset = response.headers.get_content_charset() or "utf-8"
-            return json.loads(response.read().decode(charset, errors="replace"))
+            text = response.read().decode(charset, errors="replace").lstrip("\ufeff")
+            return json.loads(text)
     except urllib.error.HTTPError as exc:
         message = _format_http_error(exc)
         if exc.code == 404:
+            if label == "更新清单":
+                raise ManifestUnavailable(message) from exc
             raise NoPublishedRelease(message) from exc
         raise UpdateError(message) from exc
     except urllib.error.URLError as exc:
         raise UpdateError(f"无法连接 GitHub: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
-        raise UpdateError("GitHub Release 信息不是有效 JSON") from exc
+        if label == "更新清单" and _looks_like_html(text):
+            raise ManifestUnavailable("更新清单尚未发布，或当前网络返回了网页而不是 JSON") from exc
+        raise UpdateError(f"{label}不是有效 JSON") from exc
+
+
+def _looks_like_html(text):
+    sample = str(text or "").lstrip()[:256].lower()
+    return sample.startswith("<!doctype html") or sample.startswith("<html") or "<html" in sample
 
 
 def _format_http_error(exc):
@@ -145,6 +166,14 @@ def _expected_asset_name(version):
     return f"{APP_NAME}-v{version}-windows.zip"
 
 
+def _latest_asset_download_url(asset_name):
+    return f"{APP_REPOSITORY_URL}/releases/latest/download/{asset_name}"
+
+
+def _is_repo_release_download_url(url):
+    return str(url or "").startswith(f"{APP_REPOSITORY_URL}/releases/download/")
+
+
 def _select_release_asset(release, version):
     assets = release.get("assets") or []
     expected = _expected_asset_name(version).lower()
@@ -174,9 +203,11 @@ def _load_latest_manifest(timeout=8):
     errors = []
     for url in _latest_manifest_candidates():
         try:
-            return _load_json(url, timeout=timeout)
+            return _load_json(url, timeout=timeout, label="更新清单", api=False)
         except NoPublishedRelease:
             return None
+        except ManifestUnavailable:
+            continue
         except UpdateError as exc:
             errors.append(str(exc))
     if errors:
@@ -200,8 +231,8 @@ def _manifest_to_update_info(manifest, current_version=APP_VERSION):
         raise UpdateError("更新清单缺少 asset_name")
 
     download_url = str(manifest.get("download_url") or "").strip()
-    if not download_url:
-        download_url = f"{APP_REPOSITORY_URL}/releases/download/{tag_name}/{asset_name}"
+    if not download_url or _is_repo_release_download_url(download_url):
+        download_url = _latest_asset_download_url(asset_name)
 
     return UpdateInfo(
         version=version,
@@ -210,7 +241,7 @@ def _manifest_to_update_info(manifest, current_version=APP_VERSION):
         body=str(manifest.get("notes") or manifest.get("body") or ""),
         asset_name=asset_name,
         download_url=download_url,
-        html_url=str(manifest.get("html_url") or f"{APP_REPOSITORY_URL}/releases/tag/{tag_name}"),
+        html_url=str(manifest.get("html_url") or f"{APP_REPOSITORY_URL}/releases/latest"),
         digest=str(manifest.get("digest") or manifest.get("sha256") or ""),
     )
 
@@ -223,7 +254,7 @@ def check_for_update(current_version=APP_VERSION, timeout=8):
         return None
 
     try:
-        release = _load_json(LATEST_RELEASE_API, timeout=timeout)
+        release = _load_json(LATEST_RELEASE_API, timeout=timeout, api=True)
     except NoPublishedRelease:
         return None
     tag_name = str(release.get("tag_name") or "")
@@ -301,9 +332,16 @@ def download_update(update_info, progress_callback=None, timeout=25):
     expected_sha256 = update_info.sha256
 
     errors = []
-    candidates = [update_info.download_url]
+    candidates = []
+    for url in (update_info.download_url, _latest_asset_download_url(update_info.asset_name)):
+        if url and url not in candidates:
+            candidates.append(url)
     if expected_sha256:
-        candidates.extend(mirrored_url(update_info.download_url, prefix) for prefix in MIRROR_PREFIXES)
+        for base_url in list(candidates):
+            for prefix in MIRROR_PREFIXES:
+                mirror = mirrored_url(base_url, prefix)
+                if mirror not in candidates:
+                    candidates.append(mirror)
 
     for index, url in enumerate(candidates):
         try:

@@ -121,13 +121,16 @@ $Manifest = [ordered]@{
     version = $AppVersion
     tag = "v$AppVersion"
     asset_name = $ZipName
-    download_url = "$RepositoryUrl/releases/download/v$AppVersion/$ZipName"
+    download_url = "$RepositoryUrl/releases/latest/download/$ZipName"
+    html_url = "$RepositoryUrl/releases/latest"
     sha256 = $ZipHash
     notes = ""
     mandatory = $false
     published_at = (Get-Date).ToString("o")
 }
-$Manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+$ManifestJson = ($Manifest | ConvertTo-Json -Depth 4) + [Environment]::NewLine
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($ManifestPath, $ManifestJson, $Utf8NoBom)
 
 Write-Host "EXE: $(Join-Path $DistDir "$AppName.exe")"
 Write-Host "ZIP: $ZipPath"

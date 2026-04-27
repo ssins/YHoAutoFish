@@ -2224,8 +2224,8 @@ class AppWindow(QMainWindow):
             self.update_info = None
             self._set_update_checking(False)
             if error:
-                self.write_log(f"[更新] 自动检查更新失败: {error}")
                 if manual:
+                    self.write_log(f"[更新] 检查更新失败: {error}")
                     self.show_toast("检查更新失败，请稍后重试", "danger")
             elif manual:
                 self.show_toast("当前已是最新版本", "success")
