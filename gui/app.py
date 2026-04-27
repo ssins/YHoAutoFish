@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from core.paths import ensure_writable_file, resource_path
 from core.state_machine import StateMachine
 from core.version import APP_AUTHOR, APP_DISPLAY_NAME, APP_REPOSITORY_URL, APP_VERSION
-from core.updater import UpdateError, check_for_update, download_update, get_download_candidates, start_external_update
+from core.updater import DownloadCancelled, UpdateError, check_for_update, download_update, get_download_candidates, start_external_update
 from gui.encyclopedia import EncyclopediaWidget
 from gui.fishing_record import FishingRecordWidget
 from gui.theme import (
@@ -577,23 +577,36 @@ class UpdateDownloadWorker(QThread):
         super().__init__(parent)
         self.update_info = update_info
         self.source = source
+        self._user_cancel_requested = False
+
+    def cancel_download(self):
+        self._user_cancel_requested = True
+        self.requestInterruption()
 
     def run(self):
+        cancel_message = "更新下载已取消。"
         try:
             def report_progress(percent, downloaded, total):
                 if self.isInterruptionRequested():
-                    raise UpdateError("更新下载已取消。")
+                    raise DownloadCancelled(cancel_message)
                 self.progress.emit(int(percent))
 
             path = download_update(
                 self.update_info,
                 progress_callback=report_progress,
                 source=self.source,
+                cancel_callback=self.isInterruptionRequested,
             )
-            if not self.isInterruptionRequested():
+            if self.isInterruptionRequested() or self._user_cancel_requested:
+                self.completed.emit(False, "", cancel_message)
+            else:
                 self.completed.emit(True, path, "")
+        except DownloadCancelled as exc:
+            self.completed.emit(False, "", str(exc) or cancel_message)
         except Exception as exc:
-            if not self.isInterruptionRequested():
+            if self._user_cancel_requested or self.isInterruptionRequested():
+                self.completed.emit(False, "", cancel_message)
+            else:
                 self.completed.emit(False, "", str(exc))
 
 
@@ -885,6 +898,7 @@ class UpdateDialog(QDialog):
         self.update_info = update_info
         self.app_window = app_window
         self.selected_update_source = "github"
+        self.is_downloading = False
         self.setModal(True)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -1009,7 +1023,7 @@ class UpdateDialog(QDialog):
         self.close_btn = QPushButton("稍后再说")
         self.close_btn.setFocusPolicy(Qt.NoFocus)
         self.close_btn.setStyleSheet(secondary_button_stylesheet())
-        self.close_btn.clicked.connect(self.reject)
+        self.close_btn.clicked.connect(self.handle_close_or_cancel)
         action_row.addWidget(self.close_btn)
 
         self.auto_btn = QPushButton("一键全自动更新")
@@ -1021,14 +1035,35 @@ class UpdateDialog(QDialog):
         layout.addLayout(action_row)
 
     def set_busy(self, busy):
+        self.is_downloading = bool(busy)
         self.auto_btn.setEnabled(not busy)
         self.manual_btn.setEnabled(not busy)
-        self.close_btn.setEnabled(not busy)
+        self.close_btn.setEnabled(True)
+        self.close_btn.setText("取消下载" if busy else "稍后再说")
         for button in self.source_buttons.values():
             button.setEnabled(not busy)
         if busy:
             self.progress.setFormat("正在下载 %p%")
             self.status_label.setText(f"正在通过{self.source_display_name()}下载更新包，请不要关闭程序。下载完成后会打开独立安装器显示安装进度。")
+
+    def handle_close_or_cancel(self):
+        if self.is_downloading:
+            self.app_window.cancel_auto_update(self)
+            return
+        self.reject()
+
+    def set_canceling(self):
+        self.close_btn.setEnabled(False)
+        self.progress.setFormat("正在取消")
+        self.status_label.setText("正在取消下载并清理未完成的更新文件...")
+
+    def set_cancelled(self, message="更新下载已取消。"):
+        self.set_busy(False)
+        self.progress.setFormat("已取消")
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['text_dim']}; font-size: 12px;"
+        )
 
     def set_progress(self, value):
         self.progress.setValue(max(0, min(100, int(value))))
@@ -1073,6 +1108,9 @@ class UpdateDialog(QDialog):
         return "Gitee 国内源" if self.selected_update_source == "gitee" else "GitHub 官方源"
 
     def open_selected_source_download(self):
+        if self.selected_update_source == "gitee" and getattr(self.update_info, "gitee_asset_parts", ()):
+            QDesktopServices.openUrl(QUrl(getattr(self.update_info, "gitee_html_url", "") or self.update_info.html_url))
+            return
         candidates = get_download_candidates(self.update_info, source=self.selected_update_source)
         if not candidates:
             self.set_error(f"{self.source_display_name()}没有可用下载地址。")
@@ -2576,11 +2614,32 @@ class AppWindow(QMainWindow):
         self.update_download_worker.finished.connect(self.update_download_worker.deleteLater)
         self.update_download_worker.start()
 
+    def cancel_auto_update(self, dialog=None):
+        worker = self.update_download_worker
+        if worker is None or not worker.isRunning():
+            if dialog is not None:
+                dialog.set_cancelled()
+            return
+        if dialog is not None:
+            dialog.set_canceling()
+        try:
+            if hasattr(worker, "cancel_download"):
+                worker.cancel_download()
+            else:
+                worker.requestInterruption()
+        except RuntimeError:
+            if dialog is not None:
+                dialog.set_cancelled()
+
     def _handle_update_download_result(self, ok, path, error, dialog):
         if getattr(self, "_shutting_down", False):
             return
         self.update_download_worker = None
         if not ok:
+            if "取消" in (error or ""):
+                dialog.set_cancelled(error or "更新下载已取消。")
+                self.write_log("[更新] 下载已取消，未完成的更新文件已清理。")
+                return
             dialog.set_error(error or "更新包下载失败。")
             return
         try:

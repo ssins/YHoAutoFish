@@ -2,7 +2,8 @@ param(
     [switch]$Plain,
     [switch]$SkipInstall,
     [string]$Notes,
-    [string]$NotesFile
+    [string]$NotesFile,
+    [string]$GiteeTag
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +19,10 @@ if ($VersionSource -notmatch 'APP_REPOSITORY_URL\s*=\s*"([^"]+)"') {
     throw "Unable to read APP_REPOSITORY_URL from core\version.py"
 }
 $RepositoryUrl = $Matches[1].TrimEnd("/")
+$GiteeRepositoryUrl = ""
+if ($VersionSource -match 'APP_GITEE_REPOSITORY_URL\s*=\s*"([^"]+)"') {
+    $GiteeRepositoryUrl = $Matches[1].TrimEnd("/")
+}
 $ReleaseDir = Join-Path $ProjectRoot "release"
 $ZipName = "$AppName-v$AppVersion-windows.zip"
 $ZipPath = Join-Path $ReleaseDir $ZipName
@@ -51,6 +56,31 @@ function Invoke-Checked {
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "$FilePath $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Get-MergedSha256 {
+    param(
+        [System.IO.FileInfo[]]$Files
+    )
+
+    $Sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $Buffer = New-Object byte[] (1024 * 1024)
+        foreach ($File in $Files) {
+            $Stream = [System.IO.File]::OpenRead($File.FullName)
+            try {
+                while (($Read = $Stream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+                    [void]$Sha.TransformBlock($Buffer, 0, $Read, $Buffer, 0)
+                }
+            } finally {
+                $Stream.Dispose()
+            }
+        }
+        [void]$Sha.TransformFinalBlock([byte[]]::new(0), 0, 0)
+        return -join ($Sha.Hash | ForEach-Object { $_.ToString("x2") })
+    } finally {
+        $Sha.Dispose()
     }
 }
 
@@ -133,16 +163,63 @@ if (-not [string]::IsNullOrWhiteSpace($NotesFile)) {
 } elseif (-not [string]::IsNullOrWhiteSpace($Notes)) {
     $ReleaseNotes = $Notes
 }
+$GitHubTag = "v$AppVersion"
+if ([string]::IsNullOrWhiteSpace($GiteeTag)) {
+    $GiteeTag = $AppVersion
+}
+$GiteeTag = $GiteeTag.Trim()
+$GitHubReleaseUrl = "$RepositoryUrl/releases/tag/$GitHubTag"
+$GiteeReleaseUrl = if (-not [string]::IsNullOrWhiteSpace($GiteeRepositoryUrl) -and -not [string]::IsNullOrWhiteSpace($GiteeTag)) {
+    "$GiteeRepositoryUrl/releases/tag/$GiteeTag"
+} else {
+    ""
+}
+$SplitPartFiles = Get-ChildItem -LiteralPath $ReleaseDir -File |
+    Where-Object { $_.Name -match "^$([Regex]::Escape($ZipName))\.\d{2,4}$" } |
+    Sort-Object Name
 $Manifest = [ordered]@{
     version = $AppVersion
-    tag = "v$AppVersion"
+    tag = $GitHubTag
     asset_name = $ZipName
     download_url = "$RepositoryUrl/releases/latest/download/$ZipName"
-    html_url = "$RepositoryUrl/releases/latest"
+    download_urls = @(
+        "$RepositoryUrl/releases/latest/download/$ZipName",
+        "$RepositoryUrl/releases/download/$GitHubTag/$ZipName"
+    )
+    github_download_urls = @(
+        "$RepositoryUrl/releases/latest/download/$ZipName",
+        "$RepositoryUrl/releases/download/$GitHubTag/$ZipName"
+    )
+    html_url = $GitHubReleaseUrl
+    github_html_url = $GitHubReleaseUrl
     sha256 = $ZipHash
+    github_sha256 = $ZipHash
     notes = $ReleaseNotes
     mandatory = $false
     published_at = (Get-Date).ToString("o")
+}
+if (-not [string]::IsNullOrWhiteSpace($GiteeRepositoryUrl) -and -not [string]::IsNullOrWhiteSpace($GiteeTag)) {
+    $Manifest["gitee_release_tag"] = $GiteeTag
+    $Manifest["gitee_html_url"] = $GiteeReleaseUrl
+    $Manifest["gitee_download_urls"] = @(
+        "$GiteeRepositoryUrl/releases/download/$GiteeTag/$ZipName"
+    )
+    if ($SplitPartFiles.Count -gt 1) {
+        $Manifest["gitee_sha256"] = Get-MergedSha256 -Files $SplitPartFiles
+        $Manifest["gitee_release_asset_names"] = @("latest.json") + @($SplitPartFiles | ForEach-Object { $_.Name })
+        $Manifest["gitee_asset_parts"] = @(
+            foreach ($PartFile in $SplitPartFiles) {
+                [ordered]@{
+                    name = $PartFile.Name
+                    size = [int64]$PartFile.Length
+                    sha256 = (Get-FileHash -LiteralPath $PartFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    gitee_download_urls = @(
+                        "$GiteeRepositoryUrl/releases/download/$GiteeTag/$($PartFile.Name)"
+                    )
+                }
+            }
+        )
+    }
 }
 $ManifestJson = ($Manifest | ConvertTo-Json -Depth 4) + [Environment]::NewLine
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)

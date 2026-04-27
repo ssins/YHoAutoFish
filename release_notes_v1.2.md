@@ -108,6 +108,10 @@ v1.2 是一次面向稳定性、兼容性和用户体验的正式修复版本。
 - 独立更新器保护用户数据，不覆盖 `config.json`、`records.json`、`records.db`、`logs/`、`screenshots/`、`captures/` 等。
 - 更新器增加自身进程保护，避免误把更新器自身当作主程序等待或覆盖。
 - 更新下载包、解压目录和更新器运行副本改为写入程序目录 `.updates/`，不再默认占用 C 盘 `%TEMP%`。
+- Gitee 更新改为补查 Release `attach_files`，修复只读 `assets` 导致拿不到真实附件、下载 404 的问题；支持按 `*.zip.001` 连续分卷自动下载并合并。
+- Gitee `latest.json` 读取链路增加多候选地址回退：直链 `latest.json` 偶发 502 时，会继续尝试附件下载接口；发布脚本也会在检测到分卷时自动写入 `gitee_asset_parts`、`github_html_url` 和 `gitee_html_url`。
+- 更新校验支持源独立 SHA256：GitHub 单包使用 `github_sha256`，Gitee 分卷合并包使用 `gitee_sha256`；下载弹窗新增取消下载，取消时会清理未完成的分卷、合并包和临时目录。
+- 修复取消下载后弹窗停留在“正在取消”的问题，所有用户主动取消路径都会回到“已取消”状态。
 
 ### 11. 发布与打包
 
