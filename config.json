@@ -24,7 +24,7 @@
     "user_takeover_start_grace": 1.2,
     "update_startup_jitter_seconds": 20,
     "update_check_interval_minutes": 30,
-    "log_line_limit": 320,
+    "log_line_limit": 800,
     "auto_switch_to_log": true,
     "debug_mode": true
 }

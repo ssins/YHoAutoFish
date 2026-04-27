@@ -453,6 +453,12 @@ class StateMachine:
         self._result_ready_confirm_count = 0
         self._result_ready_last_kind = ""
         self._result_ready_debug_saved = False
+        self._success_recorded_pending_close = False
+        self._success_close_retry_count = 0
+        self._success_close_last_esc = 0
+        self._failed_result_candidate_seen_time = 0
+        self._failed_result_candidate_count = 0
+        self._failed_result_candidate_signature = ""
         self._recovery_start_time = 0
         self._recovery_reason = ""
         self._recovery_esc_requested = False
@@ -504,6 +510,12 @@ class StateMachine:
         self._result_ready_confirm_count = 0
         self._result_ready_last_kind = ""
         self._result_ready_debug_saved = False
+        self._success_recorded_pending_close = False
+        self._success_close_retry_count = 0
+        self._success_close_last_esc = 0
+        self._failed_result_candidate_seen_time = 0
+        self._failed_result_candidate_count = 0
+        self._failed_result_candidate_signature = ""
 
     def _detect_initial_control_cluster(self, rect):
         if self.sc is None or not rect:
@@ -554,7 +566,7 @@ class StateMachine:
             parts.append(f"{item.get('key')}:{item.get('confidence', 0):.2f}/{matched_name}/{item.get('strategy') or '默认'}")
         return "；".join(parts) if parts else "无"
 
-    def _detect_ready_to_cast(self, rect, allow_heavy=False, require_initial_controls=False, include_f=True):
+    def _detect_ready_to_cast(self, rect, allow_heavy=False, require_initial_controls=False, include_f=True, include_prepare_ui=False):
         if self.sc is None or not rect:
             return None
 
@@ -584,7 +596,7 @@ class StateMachine:
                     initial_cluster = {"count": 0, "matches": [], "confidence": 0.0}
                 if require_initial_controls and initial_cluster.get("count", 0) < 2:
                     return {
-                        "kind": "F key icon",
+                        "kind": "F键图标",
                         "confidence": conf,
                         "location": None,
                         "template": matched_path,
@@ -592,7 +604,7 @@ class StateMachine:
                         "initial_controls": initial_cluster,
                     }
                 return {
-                    "kind": "initial fishing UI" if initial_cluster.get("count", 0) >= 2 else "F key icon",
+                    "kind": "钓鱼初始界面" if initial_cluster.get("count", 0) >= 2 else "F键图标",
                     "confidence": conf,
                     "location": loc,
                     "template": matched_path,
@@ -632,13 +644,34 @@ class StateMachine:
                     "initial_controls": initial_cluster,
                 }
 
-        if require_initial_controls and include_f:
+        if require_initial_controls or not include_f:
+            initial_cluster = self._detect_initial_control_cluster(rect)
+            if initial_cluster.get("count", 0) >= 2:
+                first_match = initial_cluster.get("matches", [{}])[0]
+                return {
+                    "kind": "钓鱼初始界面组合控件",
+                    "confidence": initial_cluster.get("confidence", 0.0),
+                    "location": first_match.get("location") or (0, 0),
+                    "template": first_match.get("template"),
+                    "strategy": first_match.get("strategy") or "initial-controls",
+                    "initial_controls": initial_cluster,
+                }
+            if require_initial_controls:
+                return {
+                    "kind": "钓鱼初始界面组合控件",
+                    "confidence": initial_cluster.get("confidence", best_conf if best_conf >= 0 else 0.0),
+                    "location": None,
+                    "template": None,
+                    "strategy": "initial-controls",
+                    "initial_controls": initial_cluster,
+                }
+
+        if not include_prepare_ui:
             return {
-                "kind": "钓鱼初始界面",
+                "kind": "",
                 "confidence": best_conf,
                 "location": None,
                 "template": None,
-                "initial_controls": initial_cluster or {"count": 0, "matches": [], "confidence": 0.0},
             } if best_conf >= 0 else None
 
         start_button_roi = (0.15, 0.74, 0.70, 0.23)
@@ -1912,6 +1945,19 @@ class StateMachine:
         if not hasattr(self, '_debug_count'): self._debug_count = 0
         self._debug_count += 1
 
+        now = time.time()
+        if now - getattr(self, "_idle_result_check_last", 0) >= 0.60:
+            self._idle_result_check_last = now
+            success_info = self._detect_fast_success_result(rect, fast_only=True)
+            if success_info and success_info.get("location"):
+                self._log("[待机] 检测到成功结算界面仍未关闭，优先处理结算而不是重新抛竿。")
+                self._finish_fast_success_result(rect, success_info, source_label="待机")
+                return
+            failed_info = self._detect_fast_failed_result(rect)
+            if self._maybe_finish_failed_result(rect, failed_info, source_label="待机"):
+                self._log("[待机] 检测到失败提示仍未恢复，优先进入失败恢复流程。")
+                return
+
         ready_info = self._detect_ready_to_cast(rect, allow_heavy=(self._debug_count % 6 == 0))
         if self._should_stop():
             return
@@ -1997,12 +2043,12 @@ class StateMachine:
                 max_retries = 2
                 if retry_count < max_retries:
                     self._waiting_recast_count = retry_count + 1
-                    self._log(f"[等待] 抛竿后仍检测到{ready_info.get('kind') or '钓鱼准备界面'}，判定可能未进入等待上钩流程，重试抛竿 ({self._waiting_recast_count}/{max_retries})。")
+                    self._log(f"[等待] 抛竿后仍检测到{ready_info.get('kind') or '初始钓鱼界面'}，判定可能未进入等待上钩流程，重试抛竿 ({self._waiting_recast_count}/{max_retries})。")
                     if not self._send_cast_input(ready_info, "等待"):
                         return
                     self._sleep_interruptible(0.35)
                     return
-                self._log("[等待] 多次重试后仍停留在钓鱼准备界面，进入恢复流程。")
+                self._log("[等待] 多次重试后仍停留在初始钓鱼界面，进入恢复流程。")
                 self._enter_recovering("多次重发 F 后仍未进入抛竿流程", record_empty=False, press_esc=False)
                 return
 
@@ -2204,8 +2250,8 @@ class StateMachine:
             (0.12, 0.32, 0.76, 0.34),
         )
         strategies = (
-            {"name": "failed-edge", "threshold": 0.48, "use_edge": True},
-            {"name": "failed-plain", "threshold": 0.58},
+            {"name": "failed-edge", "threshold": 0.60, "use_edge": True},
+            {"name": "failed-plain", "threshold": 0.66},
         )
         best = None
         for roi in rois:
@@ -2216,9 +2262,9 @@ class StateMachine:
                 image,
                 failed_templates,
                 strategies,
-                threshold=0.56,
-                scale_range=self._template_scale_range(rect, 0.55, 1.75),
-                scale_steps=11,
+                threshold=0.64,
+                scale_range=self._template_scale_range(rect, 0.68, 1.42),
+                scale_steps=7,
             )
             if best is None or conf > best["confidence"]:
                 best = {"location": loc, "confidence": conf, "template": matched_path, "strategy": strategy, "roi": roi}
@@ -2388,11 +2434,12 @@ class StateMachine:
                 (0.18, 0.38, 0.64, 0.22),
             ),
             (
-                {"name": "failed-fast-plain", "threshold": 0.62},
+                {"name": "failed-fast-edge", "threshold": 0.64, "use_edge": True},
+                {"name": "failed-fast-plain", "threshold": 0.70},
             ),
-            threshold=0.62,
-            low_factor=0.70,
-            high_factor=1.35,
+            threshold=0.68,
+            low_factor=0.78,
+            high_factor=1.26,
             scale_steps=5,
         )
 
@@ -2486,8 +2533,65 @@ class StateMachine:
         self._log(f"[结算] {reason}，已记录一次失败/空杆尝试。")
 
     def _finish_fast_success_result(self, rect, success_info, source_label="溜鱼"):
+        self._clear_failed_result_candidate()
         self.ctrl.release_all()
         self._finish_success_result(rect, success_info, attempt=1, max_attempts=1, source_label=source_label)
+
+    def _clear_failed_result_candidate(self):
+        self._failed_result_candidate_seen_time = 0
+        self._failed_result_candidate_count = 0
+        self._failed_result_candidate_signature = ""
+
+    def _is_strong_failed_result(self, failed_info):
+        confidence = float((failed_info or {}).get("confidence") or 0.0)
+        strategy = ((failed_info or {}).get("strategy") or "").lower()
+        if "edge" in strategy:
+            return confidence >= 0.70
+        return confidence >= 0.76
+
+    def _maybe_finish_failed_result(self, rect, failed_info, source_label="结算"):
+        if not failed_info or not failed_info.get("location"):
+            return False
+
+        confidence = float((failed_info or {}).get("confidence") or 0.0)
+        strategy = ((failed_info or {}).get("strategy") or "").lower()
+
+        # 失败横幅只有一张文字模板。低置信度 plain 匹配容易在成功结算/过渡动画中误报，
+        # 因此只允许高置信度立即判失败；其余候选必须连续出现并在确认前再次排除成功结算。
+        if self._is_strong_failed_result(failed_info):
+            self._clear_failed_result_candidate()
+            self._finish_failed_result(failed_info, source_label=source_label)
+            return True
+
+        min_candidate = 0.64 if "edge" in strategy else 0.70
+        if confidence < min_candidate:
+            self._clear_failed_result_candidate()
+            return False
+
+        now = time.time()
+        matched_path = failed_info.get("template") or ""
+        roi = failed_info.get("roi") or ()
+        signature = f"{matched_path}|{strategy}|{roi}"
+        if signature != getattr(self, "_failed_result_candidate_signature", ""):
+            self._failed_result_candidate_signature = signature
+            self._failed_result_candidate_seen_time = now
+            self._failed_result_candidate_count = 1
+            return False
+
+        self._failed_result_candidate_count = int(getattr(self, "_failed_result_candidate_count", 0)) + 1
+        seen_time = float(getattr(self, "_failed_result_candidate_seen_time", 0) or now)
+        if now - seen_time < 0.35 or self._failed_result_candidate_count < 2:
+            return False
+
+        success_info = self._detect_fast_success_result(rect, fast_only=False)
+        if success_info and success_info.get("location"):
+            self._clear_failed_result_candidate()
+            self._finish_fast_success_result(rect, success_info, source_label=source_label)
+            return True
+
+        self._clear_failed_result_candidate()
+        self._finish_failed_result(failed_info, source_label=source_label)
+        return True
 
     def _check_result_signals_during_fishing(self, rect, elapsed):
         now = time.time()
@@ -2505,8 +2609,7 @@ class StateMachine:
         if elapsed >= 1.5 and now - getattr(self, "_fishing_failed_check_last", 0) >= failed_interval:
             self._fishing_failed_check_last = now
             failed_info = self._detect_fast_failed_result(rect)
-            if failed_info and failed_info.get("location"):
-                self._finish_failed_result(failed_info, source_label="溜鱼")
+            if self._maybe_finish_failed_result(rect, failed_info, source_label="溜鱼"):
                 return True
 
         return False
@@ -2525,8 +2628,7 @@ class StateMachine:
 
         if elapsed >= 2.0:
             failed_info = self._detect_fast_failed_result(rect)
-            if failed_info and failed_info.get("location"):
-                self._finish_failed_result(failed_info, source_label="溜鱼")
+            if self._maybe_finish_failed_result(rect, failed_info, source_label="溜鱼"):
                 return True
 
         return False
@@ -2542,6 +2644,11 @@ class StateMachine:
 
     def _finish_empty_ready_result(self, ready_info, source_label="结算"):
         kind = (ready_info or {}).get("kind") or "可抛钩界面"
+        if getattr(self, "_success_recorded_pending_close", False):
+            self._log(f"[{source_label}] 已检测到{kind}，确认成功结算界面已关闭。当前累计钓获: {self.fish_count} 条。等待抛竿...")
+            self._reset_round_state()
+            self.current_state = self.STATE_IDLE
+            return
         if getattr(self, "_round_had_fishing_bar", False):
             self._record_empty_result_once(f"未检测到成功结算或失败横幅，但已回到{kind}，判定本轮失败/空杆")
         self._log(f"[{source_label}] 已回到{kind}，直接进入待机。")
@@ -2582,6 +2689,9 @@ class StateMachine:
     def _confirm_empty_ready_result(self, rect, ready_info, source_label="结算"):
         if not ready_info or not ready_info.get("location"):
             return False
+        if getattr(self, "_success_recorded_pending_close", False):
+            self._finish_empty_ready_result(ready_info, source_label=source_label)
+            return True
 
         success_info = self._detect_fast_success_result(rect, fast_only=True)
         if success_info and success_info.get("location"):
@@ -2589,8 +2699,7 @@ class StateMachine:
             return True
 
         failed_info = self._detect_fast_failed_result(rect)
-        if failed_info and failed_info.get("location"):
-            self._finish_failed_result(failed_info, source_label=source_label)
+        if self._maybe_finish_failed_result(rect, failed_info, source_label=source_label):
             return True
 
         if not getattr(self, "_round_had_fishing_bar", False):
@@ -2618,8 +2727,7 @@ class StateMachine:
             return True
 
         failed_info = self._detect_failed_result(rect)
-        if failed_info and failed_info.get("location"):
-            self._finish_failed_result(failed_info, source_label=source_label)
+        if self._maybe_finish_failed_result(rect, failed_info, source_label=source_label):
             return True
 
         if getattr(self, "_round_had_fishing_bar", False):
@@ -2642,6 +2750,8 @@ class StateMachine:
                 return False
             current_rect = self.wm.get_client_rect() or rect
             ready_info = self._detect_cast_prompt_after_settlement(current_rect)
+            if not (ready_info and ready_info.get("location")):
+                ready_info = self._detect_ready_to_cast(current_rect, allow_heavy=False, require_initial_controls=True)
             if ready_info and ready_info.get("location"):
                 self._log(f"[结算] 已检测到{ready_info.get('kind') or '可抛钩界面'}，提前进入下一轮。")
                 return True
@@ -2652,29 +2762,42 @@ class StateMachine:
     def _finish_success_result(self, rect, success_info, attempt=1, max_attempts=1, source_label="结算"):
         if getattr(self, "_stop_requested", False):
             return
-        self._log(f"[{source_label}] 识别到成功结算组合特征 (综合置信度: {success_info['confidence']:.2f}，{self._format_success_signals(success_info)})，开始识别鱼类信息...")
+        self._clear_failed_result_candidate()
+        if not getattr(self, "_success_recorded_pending_close", False):
+            self._log(f"[{source_label}] 识别到成功结算组合特征 (综合置信度: {success_info['confidence']:.2f}，{self._format_success_signals(success_info)})，开始识别鱼类信息...")
 
-        fish_name, weight_g = self._read_settlement_info(rect)
-        if getattr(self, "_stop_requested", False):
-            return
-        self.record_mgr.add_catch(fish_name, weight_g)
-        if getattr(self, "_stop_requested", False):
-            return
+            fish_name, weight_g = self._read_settlement_info(rect)
+            if getattr(self, "_stop_requested", False):
+                return
+            self.record_mgr.add_catch(fish_name, weight_g)
+            self.fish_count += 1
+            self._success_recorded_pending_close = True
+            if getattr(self, "_stop_requested", False):
+                return
 
-        self._log(f"[结算] 捕获: {fish_name}, 重量: {weight_g}g。尝试 ESC 关闭结算界面 (尝试 {attempt}/{max_attempts})...")
+            self._log(f"[结算] 捕获: {fish_name}, 重量: {weight_g}g。尝试 ESC 关闭结算界面 (尝试 {attempt}/{max_attempts})...")
+        else:
+            self._log(f"[结算] 本次成功结算已记录，继续尝试 ESC 关闭结算界面 (尝试 {attempt}/{max_attempts})...")
+
         if not self._tap_key_if_running('esc', duration=0.15):
             return
+        self._success_close_retry_count = max(int(getattr(self, "_success_close_retry_count", 0)), int(attempt))
+        self._success_close_last_esc = time.time()
         if getattr(self, "_stop_requested", False):
             return
 
         close_delay = max(0.4, min(float(self.config.get("settlement_close_delay", 1)), 5.0))
-        self._wait_after_settlement_close(rect, close_delay)
+        closed = self._wait_after_settlement_close(rect, close_delay)
         if getattr(self, "_stop_requested", False):
             return
-        self.fish_count += 1
-        self._log(f"[结算] 成功关闭结算界面。当前累计钓获: {self.fish_count} 条。等待抛竿...")
-        self._reset_round_state()
-        self.current_state = self.STATE_IDLE
+        if closed:
+            self._log(f"[结算] 成功关闭结算界面。当前累计钓获: {self.fish_count} 条。等待抛竿...")
+            self._reset_round_state()
+            self.current_state = self.STATE_IDLE
+            return
+
+        self._log("[结算] 已记录本次钓获，但尚未确认结算界面关闭，继续停留在结算状态重试 ESC。")
+        self.current_state = self.STATE_RESULT
 
     def _check_result_signals_after_bar_missing(self, rect, missing_elapsed):
         now = time.time()
@@ -2689,8 +2812,7 @@ class StateMachine:
             return True
 
         failed_info = self._detect_fast_failed_result(rect)
-        if failed_info and failed_info.get("location"):
-            self._finish_failed_result(failed_info, source_label="溜鱼")
+        if self._maybe_finish_failed_result(rect, failed_info, source_label="溜鱼"):
             return True
 
         full_interval = 0.35 if missing_elapsed < 2.0 else 0.55
@@ -2702,8 +2824,7 @@ class StateMachine:
                 return True
 
             failed_info = self._detect_failed_result(rect)
-            if failed_info and failed_info.get("location"):
-                self._finish_failed_result(failed_info, source_label="溜鱼")
+            if self._maybe_finish_failed_result(rect, failed_info, source_label="溜鱼"):
                 return True
 
         ready_check_delay = 1.15 if getattr(self, "_round_had_fishing_bar", False) else 0.45
@@ -2721,17 +2842,39 @@ class StateMachine:
         self._log("[结算] 正在检测钓鱼结果...")
 
         max_attempts = 10 # 增加循环次数，但缩短每次的等待时间，实现更敏捷的响应
+        if getattr(self, "_success_recorded_pending_close", False):
+            ready_info = self._detect_ready_to_cast(rect, allow_heavy=False, require_initial_controls=True)
+            if ready_info and ready_info.get("location"):
+                self._finish_empty_ready_result(ready_info)
+                return
+
+            now = time.time()
+            close_delay = max(0.4, min(float(self.config.get("settlement_close_delay", 1)), 5.0))
+            retry_count = int(getattr(self, "_success_close_retry_count", 0))
+            if now - getattr(self, "_success_close_last_esc", 0) >= max(0.75, close_delay):
+                if retry_count < max_attempts:
+                    self._finish_success_result(
+                        rect,
+                        {"confidence": 0.0, "signals": []},
+                        attempt=retry_count + 1,
+                        max_attempts=max_attempts,
+                    )
+                    return
+                self._log("[结算] 成功结算界面多次 ESC 后仍未确认关闭，进入恢复流程继续处理。")
+                self._enter_recovering("成功结算界面关闭未确认", record_empty=False, press_esc=True)
+                return
+
+            self._sleep_interruptible(0.15)
+            return
 
         for attempt in range(max_attempts):
             full_checked_at = time.time()
-            failed_info = self._detect_failed_result(rect)
-            if failed_info and failed_info.get("location"):
-                self._finish_failed_result(failed_info)
-                return
-
             success_info = self._detect_success_result(rect)
             if success_info and success_info.get("location"):
                 self._finish_success_result(rect, success_info, attempt=attempt + 1, max_attempts=max_attempts)
+                return
+            failed_info = self._detect_failed_result(rect)
+            if self._maybe_finish_failed_result(rect, failed_info):
                 return
             self._result_full_check_last = full_checked_at
 

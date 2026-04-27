@@ -1217,6 +1217,96 @@ class TakeoverPauseDialog(QDialog):
         layout.addWidget(close_btn, 0, Qt.AlignCenter)
 
 
+class LowResolutionWarningDialog(QDialog):
+    def __init__(self, width, height, min_width=1600, min_height=900, parent=None):
+        super().__init__(parent)
+        self.setModal(True)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.resize(660, 390)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(0)
+
+        shell = QFrame()
+        shell.setStyleSheet(
+            """
+            QFrame {
+                background-color: rgba(17, 21, 30, 0.98);
+                border: 1px solid rgba(241, 190, 103, 0.56);
+                border-radius: 30px;
+            }
+            """
+        )
+        add_shadow(shell, blur=36, alpha=140, offset=(0, 14))
+        root.addWidget(shell)
+
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(30, 26, 30, 24)
+        layout.setSpacing(16)
+
+        title = QLabel("游戏分辨率偏低")
+        title.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['text']}; font-size: 30px; font-weight: 900;"
+        )
+        layout.addWidget(title)
+
+        subtitle = QLabel(f"当前识别到的游戏客户区分辨率为 {width} × {height}，低于建议的 {min_width} × {min_height}。")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['accent_soft']}; font-size: 14px; font-weight: 800;"
+        )
+        layout.addWidget(subtitle)
+
+        body = QLabel(
+            "分辨率过低时，右下角交互图标、上钩文字、溜鱼耐力条和结算文字会占用更少像素，"
+            "识别容错会明显下降，可能出现抛竿识别慢、溜鱼跟随不稳、结算识别失败或失败后恢复变慢。"
+        )
+        body.setWordWrap(True)
+        body.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['text_dim']}; font-size: 13px; line-height: 1.7;"
+        )
+        layout.addWidget(body)
+
+        advice = QLabel("建议先把游戏窗口或全屏分辨率调高到 1600 × 900 或以上，再开始自动钓鱼。")
+        advice.setWordWrap(True)
+        advice.setStyleSheet(
+            """
+            QLabel {
+                background-color: rgba(241, 190, 103, 0.12);
+                border: 1px solid rgba(241, 190, 103, 0.32);
+                border-radius: 16px;
+                color: #FFE7B0;
+                font-size: 13px;
+                font-weight: 800;
+                padding: 12px 14px;
+            }
+            """
+        )
+        layout.addWidget(advice)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(10)
+        action_row.addStretch()
+
+        cancel_btn = QPushButton("先去调整")
+        cancel_btn.setFocusPolicy(Qt.NoFocus)
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.setStyleSheet(secondary_button_stylesheet())
+        cancel_btn.clicked.connect(self.reject)
+        action_row.addWidget(cancel_btn)
+
+        continue_btn = QPushButton("仍然继续")
+        continue_btn.setFocusPolicy(Qt.NoFocus)
+        continue_btn.setCursor(Qt.PointingHandCursor)
+        continue_btn.setStyleSheet(primary_button_stylesheet())
+        continue_btn.clicked.connect(self.accept)
+        action_row.addWidget(continue_btn)
+
+        layout.addLayout(action_row)
+
+
 class ToastPopup(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3949,11 +4039,44 @@ class AppWindow(QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
 
+    def _confirm_game_resolution_before_start(self):
+        min_width = 1600
+        min_height = 900
+
+        if not self.sm.wm.find_window():
+            return True
+
+        rect = self.sm.wm.get_client_rect()
+        if not rect:
+            return True
+
+        left, top, width, height = rect
+        if width >= min_width and height >= min_height:
+            return True
+
+        dialog = LowResolutionWarningDialog(width, height, min_width, min_height, self)
+        dialog.move(int(left + width / 2 - dialog.width() / 2), int(top + height / 2 - dialog.height() / 2))
+        result = dialog.exec()
+        if result == QDialog.Accepted:
+            self.write_log(
+                f"[系统] 当前游戏客户区分辨率 {width}x{height} 低于建议的 {min_width}x{min_height}，用户选择继续启动。"
+            )
+            return True
+
+        self.write_log(
+            f"[系统] 当前游戏客户区分辨率 {width}x{height} 低于建议的 {min_width}x{min_height}，已取消启动。"
+        )
+        self.show_toast("已取消启动，请先调高游戏分辨率", "warning")
+        return False
+
     def start_bot(self):
         if self.sm.is_running:
             return
         if not self.modules_ready:
             self.start_module_initialization()
+            return
+
+        if not self._confirm_game_resolution_before_start():
             return
 
         self._apply_state_machine_config()
