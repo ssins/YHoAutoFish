@@ -1,3 +1,4 @@
+#! python3.9
 import sys
 import os
 

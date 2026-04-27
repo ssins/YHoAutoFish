@@ -4,7 +4,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -34,6 +33,9 @@ UPDATE_CONFIG_NAME = "config.json"
 UPDATE_SOURCE_GITHUB = "github"
 UPDATE_SOURCE_GITEE = "gitee"
 UPDATE_SOURCE_AUTO = "auto"
+UPDATE_WORK_DIR_NAME = ".updates"
+UPDATE_DOWNLOAD_DIR_NAME = "downloads"
+UPDATE_RUNNER_DIR_NAME = "runners"
 
 
 class UpdateError(RuntimeError):
@@ -224,6 +226,35 @@ def _read_update_config():
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def update_work_dir(app_dir=None):
+    root = Path(app_dir or app_base_dir()).resolve() / UPDATE_WORK_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _update_subdir(name, app_dir=None):
+    root = update_work_dir(app_dir) / name
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _cleanup_old_children(root, max_age_seconds=86400):
+    root = Path(root)
+    if not root.exists():
+        return
+    now = time.time()
+    for child in root.iterdir():
+        try:
+            if now - child.stat().st_mtime < max_age_seconds:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        except OSError:
+            continue
 
 
 def _gitee_repository_url():
@@ -714,9 +745,9 @@ def download_update(update_info, progress_callback=None, timeout=25, source=UPDA
     if update_info is None:
         raise UpdateError("没有可下载的更新信息")
 
-    temp_root = Path(tempfile.gettempdir()) / APP_NAME / "downloads"
-    temp_root.mkdir(parents=True, exist_ok=True)
-    target_path = temp_root / update_info.asset_name
+    download_root = _update_subdir(UPDATE_DOWNLOAD_DIR_NAME)
+    _cleanup_old_children(download_root, max_age_seconds=86400)
+    target_path = download_root / update_info.asset_name
     expected_sha256 = update_info.sha256
 
     errors = []
@@ -752,19 +783,8 @@ def download_update(update_info, progress_callback=None, timeout=25, source=UPDA
     raise UpdateError(f"{_source_label(source)}更新包下载失败：" + "；".join(errors[-3:]))
 
 
-def cleanup_old_update_runners(max_age_seconds=86400):
-    root = Path(tempfile.gettempdir()) / APP_NAME / "runners"
-    if not root.exists():
-        return
-    now = time.time()
-    for child in root.iterdir():
-        try:
-            if not child.is_dir():
-                continue
-            if now - child.stat().st_mtime >= max_age_seconds:
-                shutil.rmtree(child, ignore_errors=True)
-        except OSError:
-            continue
+def cleanup_old_update_runners(app_dir=None, max_age_seconds=86400):
+    _cleanup_old_children(_update_subdir(UPDATE_RUNNER_DIR_NAME, app_dir=app_dir), max_age_seconds=max_age_seconds)
 
 
 def prepare_updater_runner(app_dir=None):
@@ -773,8 +793,8 @@ def prepare_updater_runner(app_dir=None):
     if not updater.exists():
         raise UpdateError("未找到 YHoUpdater.exe，当前版本不支持全自动更新")
 
-    cleanup_old_update_runners()
-    runner_dir = Path(tempfile.gettempdir()) / APP_NAME / "runners" / str(os.getpid())
+    cleanup_old_update_runners(app_dir=app_dir)
+    runner_dir = _update_subdir(UPDATE_RUNNER_DIR_NAME, app_dir=app_dir) / str(os.getpid())
     runner_dir.mkdir(parents=True, exist_ok=True)
     runner_path = runner_dir / updater.name
     shutil.copy2(updater, runner_path)

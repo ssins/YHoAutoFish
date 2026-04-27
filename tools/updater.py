@@ -6,7 +6,6 @@ import queue
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import zipfile
@@ -21,6 +20,7 @@ except Exception:
 
 
 APP_NAME = "YHoAutoFish"
+UPDATE_WORK_DIR_NAME = ".updates"
 PROTECTED_NAMES = {
     "config.json",
     "records.json",
@@ -31,6 +31,7 @@ PROTECTED_DIRS = {
     "logs",
     "screenshots",
     "captures",
+    UPDATE_WORK_DIR_NAME,
 }
 PROTECTED_PREFIXES = (
     ".records.",
@@ -392,11 +393,56 @@ def restart_app(app_dir, exe_name):
         subprocess.Popen([str(exe_path)], cwd=str(app_dir), close_fds=True)
 
 
-def remove_if_temp(path):
+def update_work_dir(app_dir):
+    root = Path(app_dir).resolve() / UPDATE_WORK_DIR_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def update_subdir(app_dir, name):
+    root = update_work_dir(app_dir) / name
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def cleanup_old_update_children(root, max_age_seconds=86400, keep_paths=None):
+    root = Path(root)
+    if not root.exists():
+        return
+    keep = set()
+    for path in keep_paths or ():
+        try:
+            keep.add(Path(path).resolve())
+        except OSError:
+            pass
+    now = time.time()
+    for child in root.iterdir():
+        try:
+            resolved = child.resolve()
+            if resolved in keep:
+                continue
+            if now - child.stat().st_mtime < max_age_seconds:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        except OSError:
+            continue
+
+
+def cleanup_update_workspace(app_dir, current_runner=None, current_extract_root=None):
+    work_dir = update_work_dir(app_dir)
+    cleanup_old_update_children(work_dir / "downloads", max_age_seconds=86400)
+    cleanup_old_update_children(work_dir / "apply", max_age_seconds=86400, keep_paths=[current_extract_root] if current_extract_root else None)
+    cleanup_old_update_children(work_dir / "runners", max_age_seconds=86400, keep_paths=[current_runner] if current_runner else None)
+
+
+def remove_if_update_download(path, app_dir):
     try:
-        temp_root = Path(tempfile.gettempdir()).resolve()
+        download_root = update_subdir(app_dir, "downloads").resolve()
         resolved = Path(path).resolve()
-        if resolved != temp_root and temp_root in resolved.parents and resolved.exists():
+        if resolved != download_root and download_root in resolved.parents and resolved.exists():
             resolved.unlink()
     except OSError:
         pass
@@ -694,7 +740,8 @@ def parse_args(argv=None):
 def perform_update(args, reporter):
     app_dir = Path(args.app_dir).resolve()
     package = Path(args.package).resolve()
-    extract_root = Path(tempfile.gettempdir()) / APP_NAME / "apply" / str(os.getpid())
+    runner_path = current_process_path()
+    extract_root = update_subdir(app_dir, "apply") / str(os.getpid())
     if int(args.pid) == os.getpid():
         raise RuntimeError("主程序 PID 不能是更新器自身 PID，已拒绝继续更新")
     if not package.exists():
@@ -702,6 +749,7 @@ def perform_update(args, reporter):
 
     try:
         log(app_dir, "更新器已启动，准备安装")
+        cleanup_update_workspace(app_dir, current_runner=runner_path.parent, current_extract_root=extract_root)
         reporter.phase("正在关闭旧版本", 8, "为避免文件被占用，安装器会先关闭旧版本程序。")
         close_running_app(app_dir, args.exe, args.pid, reporter, args.wait_timeout)
 
@@ -724,11 +772,11 @@ def perform_update(args, reporter):
             if index == total or index % 10 == 0:
                 reporter.progress_update(percent, f"已处理 {index}/{total} 个文件，复制 {copied} 个，保留用户数据 {skipped} 个。")
 
-        copied, skipped = apply_payload(payload_root, app_dir, runner_path=current_process_path(), progress_callback=on_copy)
+        copied, skipped = apply_payload(payload_root, app_dir, runner_path=runner_path, progress_callback=on_copy)
         log(app_dir, f"文件覆盖完成，复制 {copied} 个文件，跳过用户数据 {skipped} 个文件")
 
         reporter.phase("正在清理临时文件", 96, "正在清理下载包和临时解压目录。")
-        remove_if_temp(package)
+        remove_if_update_download(package, app_dir)
         shutil.rmtree(extract_root, ignore_errors=True)
         log(app_dir, "更新安装完成，等待用户选择是否启动新版")
         reporter.complete("新版已经安装完成。你可以立即启动新版，也可以先退出安装器稍后手动启动。", app_dir, args.exe)
