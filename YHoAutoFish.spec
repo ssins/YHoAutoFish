@@ -63,6 +63,7 @@ hiddenimports = [
     "cnstd",
     "cv2",
     "core.dpi",
+    "core.updater",
     "core.version",
     "mss",
     "onnxruntime",

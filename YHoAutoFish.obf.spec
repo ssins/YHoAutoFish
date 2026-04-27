@@ -69,6 +69,7 @@ hiddenimports = [
     "core.record_manager",
     "core.screen_capture",
     "core.state_machine",
+    "core.updater",
     "core.version",
     "core.vision",
     "core.window_manager",

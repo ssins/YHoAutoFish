@@ -12,10 +12,33 @@ if ($VersionSource -notmatch 'APP_VERSION\s*=\s*"([^"]+)"') {
     throw "Unable to read APP_VERSION from core\version.py"
 }
 $AppVersion = $Matches[1]
+if ($VersionSource -notmatch 'APP_REPOSITORY_URL\s*=\s*"([^"]+)"') {
+    throw "Unable to read APP_REPOSITORY_URL from core\version.py"
+}
+$RepositoryUrl = $Matches[1].TrimEnd("/")
 $ReleaseDir = Join-Path $ProjectRoot "release"
-$ZipPath = Join-Path $ReleaseDir "$AppName-v$AppVersion-windows.zip"
+$ZipName = "$AppName-v$AppVersion-windows.zip"
+$ZipPath = Join-Path $ReleaseDir $ZipName
+$IconPath = Join-Path $ProjectRoot "build_assets\logo.ico"
+$VersionInfoPath = Join-Path $ProjectRoot "version_info.txt"
+$VersionParts = @($AppVersion.Split(".") | ForEach-Object { [int]$_ })
+while ($VersionParts.Count -lt 4) {
+    $VersionParts += 0
+}
+$VersionTupleText = ($VersionParts[0..3] -join ", ")
+$VersionFileText = "$($VersionParts[0]).$($VersionParts[1]).$($VersionParts[2]).$($VersionParts[3])"
 
 Set-Location $ProjectRoot
+
+if (Test-Path -LiteralPath $VersionInfoPath) {
+    $VersionInfo = Get-Content -LiteralPath $VersionInfoPath -Raw -Encoding UTF8
+    $VersionInfo = $VersionInfo -replace 'filevers=\([^)]+\)', "filevers=($VersionTupleText)"
+    $VersionInfo = $VersionInfo -replace 'prodvers=\([^)]+\)', "prodvers=($VersionTupleText)"
+    $VersionInfo = $VersionInfo -replace "StringStruct\('FileVersion', '[^']+'\)", "StringStruct('FileVersion', '$VersionFileText')"
+    $VersionInfo = $VersionInfo -replace "StringStruct\('ProductVersion', '[^']+'\)", "StringStruct('ProductVersion', '$AppVersion')"
+    $VersionInfo = $VersionInfo.TrimEnd() + [Environment]::NewLine
+    Set-Content -LiteralPath $VersionInfoPath -Value $VersionInfo -Encoding UTF8 -NoNewline
+}
 
 function Invoke-Checked {
     param(
@@ -61,6 +84,29 @@ if (-not $DistDir) {
     throw "Build finished, but $AppName.exe was not found in expected dist directories."
 }
 
+$UpdaterDistDir = Join-Path $ProjectRoot "dist\updater"
+$UpdaterWorkDir = Join-Path $ProjectRoot "build\updater"
+$UpdaterSpecDir = Join-Path $ProjectRoot "build\updater_spec"
+Invoke-Checked "python" @(
+    "-m", "PyInstaller",
+    "--clean",
+    "--noconfirm",
+    "--onefile",
+    "--noconsole",
+    "--name", "YHoUpdater",
+    "--icon", $IconPath,
+    "--distpath", $UpdaterDistDir,
+    "--workpath", $UpdaterWorkDir,
+    "--specpath", $UpdaterSpecDir,
+    ".\tools\updater.py"
+)
+
+$UpdaterExe = Join-Path $UpdaterDistDir "YHoUpdater.exe"
+if (-not (Test-Path -LiteralPath $UpdaterExe)) {
+    throw "Updater build finished, but YHoUpdater.exe was not found."
+}
+Copy-Item -LiteralPath $UpdaterExe -Destination (Join-Path $DistDir "YHoUpdater.exe") -Force
+
 $BundledRecords = Join-Path $DistDir "records.json"
 if (Test-Path -LiteralPath $BundledRecords) {
     Remove-Item -LiteralPath $BundledRecords -Force
@@ -69,5 +115,20 @@ if (Test-Path -LiteralPath $BundledRecords) {
 New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 Compress-Archive -Path $DistDir -DestinationPath $ZipPath -Force
 
+$ZipHash = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$ManifestPath = Join-Path $ReleaseDir "latest.json"
+$Manifest = [ordered]@{
+    version = $AppVersion
+    tag = "v$AppVersion"
+    asset_name = $ZipName
+    download_url = "$RepositoryUrl/releases/download/v$AppVersion/$ZipName"
+    sha256 = $ZipHash
+    notes = ""
+    mandatory = $false
+    published_at = (Get-Date).ToString("o")
+}
+$Manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+
 Write-Host "EXE: $(Join-Path $DistDir "$AppName.exe")"
 Write-Host "ZIP: $ZipPath"
+Write-Host "MANIFEST: $ManifestPath"

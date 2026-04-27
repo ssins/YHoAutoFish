@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import queue
@@ -6,15 +7,17 @@ import ctypes
 from ctypes import wintypes
 from collections import deque
 
-from PySide6.QtCore import QPoint, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QAbstractAnimation, QEasingCurve, QPoint, Qt, QThread, QTimer, QUrl, QVariantAnimation, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QImage, QMouseEvent, QPainter, QPainterPath, QPen, QLinearGradient, QColor, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
 from core.paths import ensure_writable_file, resource_path
 from core.state_machine import StateMachine
 from core.version import APP_AUTHOR, APP_DISPLAY_NAME, APP_REPOSITORY_URL, APP_VERSION
+from core.updater import check_for_update, download_update, start_external_update
 from gui.encyclopedia import EncyclopediaWidget
 from gui.fishing_record import FishingRecordWidget
 from gui.theme import (
@@ -247,10 +251,107 @@ class LogoImageCard(QFrame):
         painter.drawPath(path)
 
 
-class TitleBrand(QFrame):
+class VersionUpdateButton(QPushButton):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.update_info = None
+        self.is_checking = False
+        self.glow_value = 0.0
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setMinimumHeight(28)
+        self.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
+        self.setStyleSheet("QPushButton { background: transparent; border: none; outline: none; }")
+        self._animation = QVariantAnimation(self)
+        self._animation.setStartValue(0.0)
+        self._animation.setEndValue(1.0)
+        self._animation.setDuration(950)
+        self._animation.setEasingCurve(QEasingCurve.InOutSine)
+        self._animation.setLoopCount(-1)
+        self._animation.valueChanged.connect(self._set_glow_value)
+        self.set_update_info(None)
+
+    def set_update_info(self, update_info):
+        self.update_info = update_info
+        self.is_checking = False
+        if update_info is None:
+            self.setText(f"YHo AutoFish v{APP_VERSION} 检查更新")
+            self.setToolTip("点击立即检查 GitHub Release 是否有新版本")
+            self._animation.stop()
+            self.glow_value = 0.0
+        else:
+            self.setText(f"YHo AutoFish v{APP_VERSION} 发现新版 v{update_info.version} 点击更新")
+            self.setToolTip(f"发现新版 v{update_info.version}，点击打开更新界面")
+            if self._animation.state() != QAbstractAnimation.Running:
+                self._animation.start()
+        self._fit_to_text()
+        self.update()
+
+    def set_checking(self, checking):
+        if self.update_info is not None:
+            return
+        self.is_checking = bool(checking)
+        if self.is_checking:
+            self.setText(f"YHo AutoFish v{APP_VERSION} 正在检查...")
+            self.setToolTip("正在检查 GitHub Release 最新版本")
+        else:
+            self.setText(f"YHo AutoFish v{APP_VERSION} 检查更新")
+            self.setToolTip("点击立即检查 GitHub Release 是否有新版本")
+        self._fit_to_text()
+        self.update()
+
+    def _fit_to_text(self):
+        width = self.fontMetrics().horizontalAdvance(self.text()) + 28
+        self.setMinimumWidth(max(154, width))
+
+    def _set_glow_value(self, value):
+        self.glow_value = float(value)
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(0, 2, -1, -2)
+        path = QPainterPath()
+        path.addRoundedRect(rect, 11, 11)
+
+        if self.update_info is None:
+            if self.is_checking:
+                bg = QColor(29, 208, 214, 54)
+                border = QColor(99, 228, 228, 145)
+                text = QColor(210, 250, 252)
+            else:
+                bg = QColor(29, 208, 214, 34)
+                border = QColor(99, 228, 228, 108)
+                text = QColor(186, 241, 245)
+                if self.isDown():
+                    bg = QColor(29, 208, 214, 64)
+                    border = QColor(99, 228, 228, 170)
+                elif self.underMouse():
+                    bg = QColor(29, 208, 214, 48)
+                    border = QColor(99, 228, 228, 150)
+                    text = QColor(226, 255, 255)
+        else:
+            ratio = 0.35 + self.glow_value * 0.65
+            bg = QColor(241, 190, 103, int(42 + ratio * 56))
+            border = QColor(241, 190, 103, int(110 + ratio * 115))
+            text = QColor(255, 239, 181)
+            if self.isDown():
+                bg = QColor(241, 190, 103, 140)
+            elif self.underMouse():
+                text = QColor(255, 251, 225)
+
+        painter.fillPath(path, bg)
+        painter.setPen(QPen(border, 1.2))
+        painter.drawPath(path)
+        painter.setPen(text)
+        painter.drawText(rect, Qt.AlignCenter, self.text())
+
+
+class TitleBrand(QFrame):
+    def __init__(self, window=None, parent=None):
+        super().__init__(parent)
+        self.window_ref = window
         self.setStyleSheet("QFrame { background: transparent; border: none; }")
 
         layout = QHBoxLayout(self)
@@ -289,22 +390,43 @@ class TitleBrand(QFrame):
         )
         layout.addWidget(title, 0, Qt.AlignVCenter)
 
-        tag = QLabel(f"YHo AutoFish v{APP_VERSION}")
-        tag.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        tag.setStyleSheet(
-            f"""
-            QLabel {{
-                background-color: rgba(29, 208, 214, 0.08);
-                border: 1px solid rgba(99, 228, 228, 0.22);
-                border-radius: 11px;
-                color: {APP_COLORS['text_soft']};
-                font-size: 10px;
-                font-weight: 800;
-                padding: 3px 8px;
-            }}
-            """
-        )
-        layout.addWidget(tag, 0, Qt.AlignVCenter)
+        self.version_button = VersionUpdateButton()
+        self.version_button.clicked.connect(self._handle_version_clicked)
+        layout.addWidget(self.version_button, 0, Qt.AlignVCenter)
+
+    def set_update_info(self, update_info):
+        self.version_button.set_update_info(update_info)
+
+    def set_update_checking(self, checking):
+        self.version_button.set_checking(checking)
+
+    def _handle_version_clicked(self):
+        if self.window_ref is not None and hasattr(self.window_ref, "show_update_dialog"):
+            self.window_ref.show_update_dialog()
+
+    def mousePressEvent(self, event):
+        if self.window_ref is not None and event.button() == Qt.LeftButton:
+            title_bar = getattr(self.window_ref, "title_bar", None)
+            if title_bar is not None:
+                title_bar.dragging = True
+                title_bar.drag_pos = event.globalPosition().toPoint() - self.window_ref.frameGeometry().topLeft()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        title_bar = getattr(self.window_ref, "title_bar", None) if self.window_ref is not None else None
+        if title_bar is not None and title_bar.dragging and not self.window_ref.isMaximized():
+            self.window_ref.move(event.globalPosition().toPoint() - title_bar.drag_pos)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        title_bar = getattr(self.window_ref, "title_bar", None) if self.window_ref is not None else None
+        if title_bar is not None:
+            title_bar.dragging = False
+        super().mouseReleaseEvent(event)
 
 
 class CustomTitleBar(QFrame):
@@ -330,8 +452,8 @@ class CustomTitleBar(QFrame):
         layout.setContentsMargins(18, 12, 14, 10)
         layout.setSpacing(10)
 
-        title = TitleBrand()
-        layout.addWidget(title)
+        self.title_brand = TitleBrand(window)
+        layout.addWidget(self.title_brand)
         layout.addStretch()
 
         self.btn_about = TitleButton("about", "rgba(29, 208, 214, 0.18)")
@@ -427,6 +549,35 @@ class RecognitionInitWorker(QThread):
         except Exception as exc:
             detail = self.state_machine.get_ocr_init_failure_message()
             self.completed.emit(False, f"{detail} 原始异常: {exc}")
+
+
+class UpdateCheckWorker(QThread):
+    completed = Signal(object, str)
+
+    def run(self):
+        try:
+            self.completed.emit(check_for_update(), "")
+        except Exception as exc:
+            self.completed.emit(None, str(exc))
+
+
+class UpdateDownloadWorker(QThread):
+    progress = Signal(int)
+    completed = Signal(bool, str, str)
+
+    def __init__(self, update_info, parent=None):
+        super().__init__(parent)
+        self.update_info = update_info
+
+    def run(self):
+        try:
+            path = download_update(
+                self.update_info,
+                progress_callback=lambda percent, _downloaded, _total: self.progress.emit(int(percent)),
+            )
+            self.completed.emit(True, path, "")
+        except Exception as exc:
+            self.completed.emit(False, "", str(exc))
 
 
 class PolicyDialog(QDialog):
@@ -603,6 +754,136 @@ class AboutDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         action_row.addWidget(close_btn)
         layout.addLayout(action_row)
+
+
+class UpdateDialog(QDialog):
+    def __init__(self, update_info, app_window, parent=None):
+        super().__init__(parent)
+        self.update_info = update_info
+        self.app_window = app_window
+        self.setModal(True)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.resize(720, 500)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(0)
+
+        shell = QFrame()
+        shell.setStyleSheet(
+            f"""
+            QFrame {{
+                background-color: rgba(11, 22, 36, 0.98);
+                border: 1px solid rgba(241, 190, 103, 0.42);
+                border-radius: 30px;
+            }}
+            """
+        )
+        add_shadow(shell, blur=38, alpha=135, offset=(0, 14))
+        root.addWidget(shell)
+
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(14)
+
+        title = QLabel(f"发现新版 v{update_info.version}")
+        title.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['text']}; font-size: 30px; font-weight: 900;"
+        )
+        layout.addWidget(title)
+
+        subtitle = QLabel(f"当前版本 v{APP_VERSION}，发布包：{update_info.asset_name}")
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['accent_soft']}; font-size: 13px; font-weight: 800;"
+        )
+        layout.addWidget(subtitle)
+
+        notes = QTextEdit()
+        notes.setReadOnly(True)
+        notes.setFocusPolicy(Qt.NoFocus)
+        notes.setStyleSheet(text_edit_stylesheet())
+        release_body = html.escape(update_info.body or "此版本未填写更新说明。").replace("\n", "<br>")
+        notes.setHtml(f"<div style='font-family:Microsoft YaHei UI; color:#9AB0CA; font-size:13px;'>{release_body}</div>")
+        layout.addWidget(notes, 1)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("等待开始")
+        self.progress.setStyleSheet(
+            f"""
+            QProgressBar {{
+                background-color: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(111, 145, 182, 0.18);
+                border-radius: 12px;
+                color: {APP_COLORS['text_dim']};
+                font-size: 12px;
+                font-weight: 800;
+                text-align: center;
+                min-height: 24px;
+            }}
+            QProgressBar::chunk {{
+                border-radius: 11px;
+                background-color: {APP_COLORS['accent']};
+            }}
+            """
+        )
+        layout.addWidget(self.progress)
+
+        self.status_label = QLabel("自动更新会先下载新版压缩包，再启动独立更新器覆盖程序文件；用户数据不会被覆盖。")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['text_dim']}; font-size: 12px;"
+        )
+        layout.addWidget(self.status_label)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(10)
+
+        self.manual_btn = QPushButton("手动下载压缩包")
+        self.manual_btn.setFocusPolicy(Qt.NoFocus)
+        self.manual_btn.setCursor(Qt.PointingHandCursor)
+        self.manual_btn.setStyleSheet(secondary_button_stylesheet())
+        self.manual_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(update_info.download_url)))
+        action_row.addWidget(self.manual_btn)
+
+        action_row.addStretch()
+
+        self.close_btn = QPushButton("稍后再说")
+        self.close_btn.setFocusPolicy(Qt.NoFocus)
+        self.close_btn.setStyleSheet(secondary_button_stylesheet())
+        self.close_btn.clicked.connect(self.reject)
+        action_row.addWidget(self.close_btn)
+
+        self.auto_btn = QPushButton("一键全自动更新")
+        self.auto_btn.setFocusPolicy(Qt.NoFocus)
+        self.auto_btn.setCursor(Qt.PointingHandCursor)
+        self.auto_btn.setStyleSheet(primary_button_stylesheet())
+        self.auto_btn.clicked.connect(lambda: app_window.start_auto_update(self))
+        action_row.addWidget(self.auto_btn)
+        layout.addLayout(action_row)
+
+    def set_busy(self, busy):
+        self.auto_btn.setEnabled(not busy)
+        self.manual_btn.setEnabled(not busy)
+        self.close_btn.setEnabled(not busy)
+        if busy:
+            self.progress.setFormat("正在下载 %p%")
+            self.status_label.setText("正在下载更新包，请不要关闭程序。")
+
+    def set_progress(self, value):
+        self.progress.setValue(max(0, min(100, int(value))))
+
+    def set_error(self, message):
+        self.set_busy(False)
+        self.progress.setFormat("更新失败")
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['danger']}; font-size: 12px; font-weight: 800;"
+        )
 
 
 class TakeoverPauseDialog(QDialog):
@@ -1661,6 +1942,12 @@ class AppWindow(QMainWindow):
         self.modules_initializing = False
         self.init_animation_step = 0
         self.ocr_init_worker = None
+        self.update_info = None
+        self.update_check_worker = None
+        self.update_download_worker = None
+        self.update_dialog = None
+        self.update_check_interval_ms = 6 * 60 * 60 * 1000
+        self._update_check_manual_pending = False
         self._settings_building = False
         self._settings_dirty = False
         self._settings_category_buttons = []
@@ -1677,6 +1964,10 @@ class AppWindow(QMainWindow):
 
         self.init_animation_timer = QTimer(self)
         self.init_animation_timer.timeout.connect(self._tick_init_animation)
+
+        self.update_check_timer = QTimer(self)
+        self.update_check_timer.setInterval(self.update_check_interval_ms)
+        self.update_check_timer.timeout.connect(lambda: self.start_update_check(manual=False))
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE):
@@ -1891,12 +2182,106 @@ class AppWindow(QMainWindow):
     def _handle_source_warning_result(self, result):
         if result != QDialog.Accepted:
             self.close()
+            return
+        self._start_update_polling()
+        QTimer.singleShot(900, lambda: self.start_update_check(manual=False))
 
     def show_about_dialog(self):
         self.about_dialog = AboutDialog(self)
         dialog = self.about_dialog
         dialog.move(self.geometry().center() - dialog.rect().center())
         dialog.open()
+
+    def _start_update_polling(self):
+        if not self.update_check_timer.isActive():
+            self.update_check_timer.start()
+
+    def _set_update_checking(self, checking):
+        title_brand = getattr(getattr(self, "title_bar", None), "title_brand", None)
+        if title_brand is not None:
+            title_brand.set_update_checking(checking)
+
+    def start_update_check(self, manual=False):
+        if self.update_info is not None and not manual:
+            return
+        if manual:
+            self._update_check_manual_pending = True
+            self._set_update_checking(True)
+        if self.update_check_worker is not None and self.update_check_worker.isRunning():
+            return
+        if self.update_info is None:
+            self._set_update_checking(True)
+        self.update_check_worker = UpdateCheckWorker(self)
+        self.update_check_worker.completed.connect(self._handle_update_check_result)
+        self.update_check_worker.finished.connect(self.update_check_worker.deleteLater)
+        self.update_check_worker.start()
+
+    def _handle_update_check_result(self, update_info, error):
+        self.update_check_worker = None
+        manual = self._update_check_manual_pending
+        self._update_check_manual_pending = False
+        if update_info is None:
+            self.update_info = None
+            self._set_update_checking(False)
+            if error:
+                self.write_log(f"[更新] 自动检查更新失败: {error}")
+                if manual:
+                    self.show_toast("检查更新失败，请稍后重试", "danger")
+            elif manual:
+                self.show_toast("当前已是最新版本", "success")
+            return
+        self.update_info = update_info
+        if self.update_check_timer.isActive():
+            self.update_check_timer.stop()
+        title_brand = getattr(getattr(self, "title_bar", None), "title_brand", None)
+        if title_brand is not None:
+            title_brand.set_update_info(update_info)
+        self.write_log(f"[更新] 发现新版 v{update_info.version}，可点击标题栏版本号更新。")
+        self.show_toast(f"发现新版 v{update_info.version}", "success")
+
+    def show_update_dialog(self):
+        if self.update_info is None:
+            self.show_toast("正在检查更新", "info")
+            self.start_update_check(manual=True)
+            return
+        self.update_dialog = UpdateDialog(self.update_info, self, self)
+        dialog = self.update_dialog
+        dialog.move(self.geometry().center() - dialog.rect().center())
+        dialog.open()
+
+    def start_auto_update(self, dialog):
+        if self.update_info is None:
+            dialog.set_error("当前没有可安装的更新信息。")
+            return
+        if self.update_download_worker is not None and self.update_download_worker.isRunning():
+            return
+        dialog.set_busy(True)
+        self.update_download_worker = UpdateDownloadWorker(self.update_info, self)
+        self.update_download_worker.progress.connect(dialog.set_progress)
+        self.update_download_worker.completed.connect(lambda ok, path, error: self._handle_update_download_result(ok, path, error, dialog))
+        self.update_download_worker.finished.connect(self.update_download_worker.deleteLater)
+        self.update_download_worker.start()
+
+    def _handle_update_download_result(self, ok, path, error, dialog):
+        self.update_download_worker = None
+        if not ok:
+            dialog.set_error(error or "更新包下载失败。")
+            return
+        try:
+            start_external_update(path, main_pid=os.getpid())
+        except Exception as exc:
+            dialog.set_error(str(exc))
+            return
+
+        dialog.progress.setValue(100)
+        dialog.progress.setFormat("下载完成，正在启动更新器")
+        dialog.status_label.setText("独立更新器已启动，程序即将退出并自动替换文件。")
+        self.write_log("[更新] 更新包已下载，正在退出并交由独立更新器安装。")
+        if self.sm.is_running:
+            self.sm.stop()
+        if self.floating_window is not None:
+            self.floating_window.close()
+        QTimer.singleShot(650, QApplication.quit)
 
     def show_toast(self, text, tone="info"):
         if hasattr(self, "toast"):
