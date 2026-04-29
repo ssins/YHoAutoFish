@@ -2827,13 +2827,9 @@ class StateMachine:
             if self._maybe_finish_failed_result(rect, failed_info, source_label="溜鱼"):
                 return True
 
-        ready_check_delay = 1.15 if getattr(self, "_round_had_fishing_bar", False) else 0.45
-        if missing_elapsed >= ready_check_delay:
-            ready_info = self._detect_ready_to_cast(rect, allow_heavy=False, require_initial_controls=True)
-            if ready_info and ready_info.get("location"):
-                return self._confirm_empty_ready_result(rect, ready_info, source_label="溜鱼")
-            self._clear_result_ready_candidate()
-
+        # STATE_FISHING must not use F/Q/E/R ready UI as a terminal signal.
+        # Those translucent templates can false-positive on the fishing HUD/background
+        # and stop reel control before settlement is actually reached.
         return False
 
     def _handle_result(self, rect):
