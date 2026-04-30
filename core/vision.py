@@ -128,10 +128,21 @@ class VisionCore:
         if steps == 1 or abs(high - low) < 0.001:
             return [low]
         scales = list(np.linspace(high, low, steps))
+        common_scales = (
+            0.50, 0.5625, 0.625, 0.667, 0.75, 0.80, 0.833, 0.875,
+            0.90, 1.0, 1.10, 1.125, 1.20, 1.25, 1.333, 1.50,
+            1.60, 1.667, 1.75, 2.0, 2.25, 2.50, 2.667, 3.0,
+        )
+        if steps >= 7:
+            scales.extend(scale for scale in common_scales if low <= scale <= high)
         if low <= 1.0 <= high and all(abs(scale - 1.0) > 0.015 for scale in scales):
             scales.append(1.0)
-            scales.sort(reverse=True)
-        return scales
+        merge_tolerance = max(0.012, min(0.08, (high - low) / max(steps * 2.0, 1.0)))
+        unique_scales = []
+        for scale in sorted(scales, reverse=True):
+            if all(abs(scale - existing) > merge_tolerance for existing in unique_scales):
+                unique_scales.append(scale)
+        return unique_scales
 
     def find_template(
         self,
@@ -186,8 +197,8 @@ class VisionCore:
             
             for scale in self._build_scales(scale_range=scale_range, scale_steps=scale_steps):
                 # 缩放模板
-                width = int(template_gray.shape[1] * scale)
-                height = int(template_gray.shape[0] * scale)
+                width = int(round(template_gray.shape[1] * scale))
+                height = int(round(template_gray.shape[0] * scale))
                 
                 # 如果缩放后的模板比截图还要大，就跳过
                 if width < 4 or height < 4 or width > screen_gray.shape[1] or height > screen_gray.shape[0]:

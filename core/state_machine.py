@@ -384,9 +384,9 @@ class StateMachine:
 
     def _initial_control_match_strategies(self):
         return (
-            {"name": "control-gray-mask", "threshold": 0.60, "use_mask": True, "mask_threshold": 6},
-            {"name": "control-edge", "threshold": 0.54, "use_edge": True},
-            {"name": "control-plain", "threshold": 0.62},
+            {"name": "control-gray-mask", "threshold": 0.60, "use_mask": True, "mask_threshold": 6, "early_accept": 0.90},
+            {"name": "control-edge", "threshold": 0.54, "use_edge": True, "early_accept": 0.88},
+            {"name": "control-plain", "threshold": 0.62, "early_accept": 0.90},
         )
 
     def _normalize_tracking_strength(self):
@@ -453,6 +453,7 @@ class StateMachine:
         self._result_ready_confirm_count = 0
         self._result_ready_last_kind = ""
         self._result_ready_debug_saved = False
+        self._result_text_probe_done = False
         self._success_recorded_pending_close = False
         self._success_close_retry_count = 0
         self._success_close_last_esc = 0
@@ -510,6 +511,7 @@ class StateMachine:
         self._result_ready_confirm_count = 0
         self._result_ready_last_kind = ""
         self._result_ready_debug_saved = False
+        self._result_text_probe_done = False
         self._success_recorded_pending_close = False
         self._success_close_retry_count = 0
         self._success_close_last_esc = 0
@@ -519,12 +521,12 @@ class StateMachine:
 
     def _detect_initial_control_cluster(self, rect):
         if self.sc is None or not rect:
-            return {"count": 0, "matches": [], "confidence": 0.0}
+            return {"count": 0, "matches": [], "confidence": 0.0, "valid": False}
 
         controls_roi = getattr(self, "roi_initial_controls", (0.70, 0.50, 0.30, 0.50))
         controls_img = self.sc.capture_relative(rect, *controls_roi)
         if controls_img is None:
-            return {"count": 0, "matches": [], "confidence": 0.0}
+            return {"count": 0, "matches": [], "confidence": 0.0, "valid": False}
 
         button_sets = (
             ("Q", self._initial_q_button_templates()),
@@ -540,7 +542,7 @@ class StateMachine:
                 self._initial_control_match_strategies(),
                 threshold=0.58,
                 scale_range=self._template_scale_range(rect, 0.50, 1.80),
-                scale_steps=9,
+                scale_steps=5,
             )
             best_conf = max(best_conf, float(conf or 0.0))
             if loc:
@@ -556,7 +558,80 @@ class StateMachine:
             avg_conf = sum(item["confidence"] for item in matches) / len(matches)
         else:
             avg_conf = best_conf
-        return {"count": len(matches), "matches": matches, "confidence": avg_conf}
+        return {
+            "count": len(matches),
+            "matches": matches,
+            "confidence": avg_conf,
+            "valid": self._initial_control_cluster_is_valid(matches, controls_img.shape),
+        }
+
+    def _initial_control_cluster_is_valid(self, matches, image_shape):
+        if not matches or len(matches) < 2 or not image_shape:
+            return False
+        height, width = image_shape[:2]
+        if width <= 0 or height <= 0:
+            return False
+
+        centers = [item.get("location") for item in matches if item.get("location")]
+        if len(centers) < 2:
+            return False
+
+        xs = [float(point[0]) for point in centers]
+        ys = [float(point[1]) for point in centers]
+        x_span = max(xs) - min(xs)
+        y_span = max(ys) - min(ys)
+        horizontal_layout = (
+            x_span >= max(56.0, width * 0.10)
+            and x_span <= max(360.0, width * 0.72)
+            and y_span <= max(90.0, height * 0.24)
+            and min(ys) >= height * 0.52
+        )
+        vertical_layout = (
+            x_span <= max(130.0, width * 0.28)
+            and y_span >= max(42.0, height * 0.14)
+            and min(ys) >= height * 0.20
+        )
+        if not horizontal_layout and not vertical_layout:
+            return False
+
+        confidences = [float(item.get("confidence") or 0.0) for item in matches]
+        if len(matches) >= 3:
+            return sum(confidences) / len(confidences) >= 0.56
+        return sum(confidences) / len(confidences) >= 0.62
+
+    def _detect_initial_f_prompt_quick(self, rect, threshold=0.88):
+        if self.sc is None or not rect:
+            return None
+
+        f_roi = getattr(self, "roi_f_btn", (0.75, 0.75, 0.25, 0.25))
+        btn_img = self.sc.capture_relative(rect, *f_roi)
+        if btn_img is None:
+            return None
+
+        loc, conf, matched_path, strategy_name = self.vis.find_best_template_multi_strategy(
+            btn_img,
+            self._f_button_templates(),
+            (
+                {"name": "f-quick-gray-mask", "threshold": threshold, "use_mask": True, "mask_threshold": 6, "early_accept": max(threshold, 0.94)},
+                {"name": "f-quick-edge", "threshold": max(0.80, threshold - 0.04), "use_edge": True, "early_accept": max(threshold, 0.92)},
+            ),
+            threshold=threshold,
+            scale_range=self._template_scale_range(rect, 0.84, 1.20),
+            scale_steps=3,
+        )
+        if not loc:
+            return None
+        return {
+            "kind": "F键图标",
+            "confidence": conf,
+            "location": loc,
+            "template": matched_path,
+            "strategy": strategy_name,
+        }
+
+    def _has_initial_fishing_ui(self, rect):
+        info = self._detect_cast_prompt_after_settlement(rect)
+        return bool(info and info.get("location"))
 
     def _format_initial_controls(self, cluster_info):
         parts = []
@@ -594,7 +669,7 @@ class StateMachine:
                     initial_cluster = self._detect_initial_control_cluster(rect)
                 else:
                     initial_cluster = {"count": 0, "matches": [], "confidence": 0.0}
-                if require_initial_controls and initial_cluster.get("count", 0) < 2:
+                if require_initial_controls and (initial_cluster.get("count", 0) < 2 or not initial_cluster.get("valid")):
                     return {
                         "kind": "F键图标",
                         "confidence": conf,
@@ -604,7 +679,7 @@ class StateMachine:
                         "initial_controls": initial_cluster,
                     }
                 return {
-                    "kind": "钓鱼初始界面" if initial_cluster.get("count", 0) >= 2 else "F键图标",
+                    "kind": "钓鱼初始界面" if initial_cluster.get("count", 0) >= 2 and initial_cluster.get("valid") else "F键图标",
                     "confidence": conf,
                     "location": loc,
                     "template": matched_path,
@@ -626,7 +701,7 @@ class StateMachine:
                     initial_cluster = self._detect_initial_control_cluster(rect)
                 else:
                     initial_cluster = {"count": 0, "matches": [], "confidence": 0.0}
-                if require_initial_controls and initial_cluster.get("count", 0) < 2:
+                if require_initial_controls and (initial_cluster.get("count", 0) < 2 or not initial_cluster.get("valid")):
                     return {
                         "kind": "F键图标",
                         "confidence": conf,
@@ -636,7 +711,7 @@ class StateMachine:
                         "initial_controls": initial_cluster,
                     }
                 return {
-                    "kind": "钓鱼初始界面" if initial_cluster.get("count", 0) >= 2 else "F键图标",
+                    "kind": "钓鱼初始界面" if initial_cluster.get("count", 0) >= 2 and initial_cluster.get("valid") else "F键图标",
                     "confidence": conf,
                     "location": loc,
                     "template": matched_path,
@@ -646,7 +721,7 @@ class StateMachine:
 
         if require_initial_controls or not include_f:
             initial_cluster = self._detect_initial_control_cluster(rect)
-            if initial_cluster.get("count", 0) >= 2:
+            if initial_cluster.get("count", 0) >= 2 and initial_cluster.get("valid"):
                 first_match = initial_cluster.get("matches", [{}])[0]
                 return {
                     "kind": "钓鱼初始界面组合控件",
@@ -763,7 +838,7 @@ class StateMachine:
             btn_img,
             self._f_button_templates(),
             (
-                {"name": "settlement-f-gray", "threshold": 0.60, "use_mask": True},
+                {"name": "settlement-f-gray", "threshold": 0.60, "use_mask": True, "early_accept": 0.94},
             ),
             threshold=0.60,
             scale_range=self._template_scale_range(rect, 0.82, 1.28),
@@ -771,12 +846,16 @@ class StateMachine:
         )
         if not loc:
             return None
+        initial_cluster = self._detect_initial_control_cluster(rect)
+        if initial_cluster.get("count", 0) < 2 or not initial_cluster.get("valid"):
+            return None
         return {
-            "kind": "F键图标",
+            "kind": "钓鱼初始界面",
             "confidence": conf,
             "location": loc,
             "template": matched_path,
             "strategy": strategy_name,
+            "initial_controls": initial_cluster,
         }
 
     def _enter_recovering(self, reason, record_empty=False, press_esc=False):
@@ -1772,7 +1851,7 @@ class StateMachine:
                 path = f"debug_settlement_unknown_name_roi_{timestamp}_{index}.png"
                 cv2.imwrite(path, roi_image)
 
-    def _read_settlement_info(self, rect):
+    def _read_settlement_info(self, rect, save_unknown_debug=True):
         fish_name = ""
         weight_g = 0
         self._last_name_ocr_candidates = []
@@ -1835,7 +1914,8 @@ class StateMachine:
             candidates = self._format_name_ocr_candidates()
             if candidates:
                 self._log(f"[识别] 鱼名 OCR 候选未命中图鉴: {candidates}")
-            self._save_unknown_settlement_debug(rect, name_rois)
+            if save_unknown_debug:
+                self._save_unknown_settlement_debug(rect, name_rois)
             fish_name = "未知鱼类"
             self._log("[识别] 未能稳定识别到鱼名，已按未知鱼类记录。")
 
@@ -1945,19 +2025,6 @@ class StateMachine:
         if not hasattr(self, '_debug_count'): self._debug_count = 0
         self._debug_count += 1
 
-        now = time.time()
-        if now - getattr(self, "_idle_result_check_last", 0) >= 0.60:
-            self._idle_result_check_last = now
-            success_info = self._detect_fast_success_result(rect, fast_only=True)
-            if success_info and success_info.get("location"):
-                self._log("[待机] 检测到成功结算界面仍未关闭，优先处理结算而不是重新抛竿。")
-                self._finish_fast_success_result(rect, success_info, source_label="待机")
-                return
-            failed_info = self._detect_fast_failed_result(rect)
-            if self._maybe_finish_failed_result(rect, failed_info, source_label="待机"):
-                self._log("[待机] 检测到失败提示仍未恢复，优先进入失败恢复流程。")
-                return
-
         ready_info = self._detect_ready_to_cast(rect, allow_heavy=(self._debug_count % 6 == 0))
         if self._should_stop():
             return
@@ -1971,7 +2038,20 @@ class StateMachine:
             self._log(f"[待机] > 发送完成，等待 {cast_delay} 秒抛竿动画...")
             self.current_state = self.STATE_WAITING
             self._sleep_interruptible(cast_delay) # 抛竿动画较长，防抖
+            return
         else:
+            now = time.time()
+            if now - getattr(self, "_idle_result_check_last", 0) >= 1.20:
+                self._idle_result_check_last = now
+                success_info = self._detect_fast_success_result(rect, fast_only=True)
+                if success_info and success_info.get("location"):
+                    self._log("[待机] 检测到成功结算界面仍未关闭，优先处理结算。")
+                    self._finish_fast_success_result(rect, success_info, source_label="待机")
+                    return
+                failed_info = self._detect_fast_failed_result(rect)
+                if self._maybe_finish_failed_result(rect, failed_info, source_label="待机"):
+                    self._log("[待机] 检测到失败提示仍未恢复，进入失败恢复流程。")
+                    return
             if self._debug_count % 10 == 0 and self._debug_count <= 30:
                 btn_img = self.sc.capture_relative(rect, *roi)
                 if btn_img is not None:
@@ -2327,7 +2407,7 @@ class StateMachine:
             threshold=0.70,
             low_factor=0.82,
             high_factor=1.24,
-            scale_steps=3,
+            scale_steps=5,
         )
         if close_info and close_info.get("location") and close_info.get("confidence", 0.0) >= 0.84:
             return self._build_success_result_info([close_info])
@@ -2345,14 +2425,32 @@ class StateMachine:
             threshold=0.64,
             low_factor=0.82,
             high_factor=1.24,
-            scale_steps=3,
+            scale_steps=5,
         )
-        if exp_info and exp_info.get("location") and exp_info.get("confidence", 0.0) >= 0.80:
-            return self._build_success_result_info([exp_info])
+        if exp_info and exp_info.get("location") and exp_info.get("confidence", 0.0) >= 0.92:
+            weight_info = self._match_result_signal(
+                rect,
+                "重量单位 g",
+                self._weight_unit_templates(),
+                (
+                    (0.33, 0.58, 0.34, 0.18),
+                ),
+                (
+                    {"name": "g-ultra-plain", "threshold": 0.70},
+                ),
+                threshold=0.70,
+                low_factor=0.82,
+                high_factor=1.24,
+                scale_steps=5,
+            )
+            if weight_info and weight_info.get("location"):
+                return self._build_success_result_info([exp_info, weight_info])
 
         return None
 
     def _detect_fast_success_result(self, rect, fast_only=False):
+        if self._detect_initial_f_prompt_quick(rect, threshold=0.88):
+            return None
         ultra_info = self._detect_ultrafast_success_result(rect)
         if ultra_info and ultra_info.get("location"):
             return ultra_info
@@ -2374,13 +2472,13 @@ class StateMachine:
             threshold=0.66,
             low_factor=0.62,
             high_factor=1.50,
-            scale_steps=7,
+            scale_steps=11,
         )
         if not close_info or not close_info.get("location"):
             return None
 
         success_signals = [close_info]
-        if close_info.get("confidence", 0.0) >= 0.88:
+        if close_info.get("confidence", 0.0) >= 0.92:
             return self._build_success_result_info(success_signals)
 
         weight_info = self._match_result_signal(
@@ -2397,7 +2495,7 @@ class StateMachine:
             threshold=0.64,
             low_factor=0.70,
             high_factor=1.35,
-            scale_steps=5,
+            scale_steps=9,
         )
         if weight_info and weight_info.get("location"):
             success_signals.append(weight_info)
@@ -2417,7 +2515,7 @@ class StateMachine:
             threshold=0.58,
             low_factor=0.70,
             high_factor=1.35,
-            scale_steps=5,
+            scale_steps=9,
         )
         if exp_info and exp_info.get("location"):
             success_signals.append(exp_info)
@@ -2444,6 +2542,9 @@ class StateMachine:
         )
 
     def _detect_success_result(self, rect):
+        if self._detect_initial_f_prompt_quick(rect, threshold=0.88):
+            return None
+
         success_signals = []
 
         weight_info = self._match_result_signal(
@@ -2463,7 +2564,7 @@ class StateMachine:
             threshold=0.58,
             low_factor=0.45,
             high_factor=1.95,
-            scale_steps=13,
+            scale_steps=17,
         )
         if weight_info and weight_info.get("location"):
             success_signals.append(weight_info)
@@ -2484,7 +2585,7 @@ class StateMachine:
             threshold=0.60,
             low_factor=0.52,
             high_factor=1.80,
-            scale_steps=11,
+            scale_steps=17,
         )
         if close_info and close_info.get("location"):
             success_signals.append(close_info)
@@ -2507,7 +2608,7 @@ class StateMachine:
             threshold=0.58,
             low_factor=0.52,
             high_factor=1.80,
-            scale_steps=11,
+            scale_steps=17,
         )
         if exp_info and exp_info.get("location"):
             success_signals.append(exp_info)
@@ -2686,6 +2787,40 @@ class StateMachine:
             return 0.0
         return max(0.0, time.time() - start_time)
 
+    def _is_known_settlement_name(self, fish_name):
+        fish_name = (fish_name or "").strip()
+        if not fish_name or fish_name in {"未知鱼类", "未识别鱼类"}:
+            return False
+        return fish_name in self.record_mgr.get_encyclopedia()
+
+    def _try_finish_success_by_settlement_probe(self, rect, source_label="结算"):
+        if getattr(self, "_result_text_probe_done", False):
+            return False
+        self._result_text_probe_done = True
+        fish_name, weight_g = self._read_settlement_info(rect, save_unknown_debug=False)
+        if not self._is_known_settlement_name(fish_name):
+            return False
+        success_info = {
+            "confidence": 0.62,
+            "signals": [
+                {
+                    "kind": "结算文字",
+                    "confidence": 0.62,
+                    "template": None,
+                    "strategy": "settlement-text",
+                }
+            ],
+        }
+        self._finish_success_result(
+            rect,
+            success_info,
+            attempt=1,
+            max_attempts=1,
+            source_label=source_label,
+            settlement_info=(fish_name, weight_g),
+        )
+        return True
+
     def _confirm_empty_ready_result(self, rect, ready_info, source_label="结算"):
         if not ready_info or not ready_info.get("location"):
             return False
@@ -2718,7 +2853,10 @@ class StateMachine:
 
         self._result_ready_confirm_count += 1
         confirm_delay = self._normalize_ratio_config("empty_ready_confirm_delay", 0.45, 0.25, 3.0)
-        if now - self._result_ready_seen_time < confirm_delay or self._result_ready_confirm_count < 2:
+        if getattr(self, "_round_had_fishing_bar", False):
+            confirm_delay = max(confirm_delay, 3.0)
+        min_confirm_count = 4 if getattr(self, "_round_had_fishing_bar", False) else 2
+        if now - self._result_ready_seen_time < confirm_delay or self._result_ready_confirm_count < min_confirm_count:
             return False
 
         success_info = self._detect_success_result(rect)
@@ -2729,6 +2867,10 @@ class StateMachine:
         failed_info = self._detect_failed_result(rect)
         if self._maybe_finish_failed_result(rect, failed_info, source_label=source_label):
             return True
+
+        if getattr(self, "_round_had_fishing_bar", False):
+            if self._try_finish_success_by_settlement_probe(rect, source_label=source_label):
+                return True
 
         if getattr(self, "_round_had_fishing_bar", False):
             last_full_check = getattr(self, "_result_full_check_last", 0)
@@ -2759,14 +2901,17 @@ class StateMachine:
                 return False
         return False
 
-    def _finish_success_result(self, rect, success_info, attempt=1, max_attempts=1, source_label="结算"):
+    def _finish_success_result(self, rect, success_info, attempt=1, max_attempts=1, source_label="结算", settlement_info=None):
         if getattr(self, "_stop_requested", False):
             return
         self._clear_failed_result_candidate()
         if not getattr(self, "_success_recorded_pending_close", False):
             self._log(f"[{source_label}] 识别到成功结算组合特征 (综合置信度: {success_info['confidence']:.2f}，{self._format_success_signals(success_info)})，开始识别鱼类信息...")
 
-            fish_name, weight_g = self._read_settlement_info(rect)
+            if settlement_info is None:
+                fish_name, weight_g = self._read_settlement_info(rect)
+            else:
+                fish_name, weight_g = settlement_info
             if getattr(self, "_stop_requested", False):
                 return
             self.record_mgr.add_catch(fish_name, weight_g)
@@ -2863,16 +3008,34 @@ class StateMachine:
             self._sleep_interruptible(0.15)
             return
 
+        result_start = time.time()
+        result_timeout = max(6.0, min(float(self.config.get("result_detect_timeout", 9.0)), 18.0))
+        full_interval = 0.70
         for attempt in range(max_attempts):
-            full_checked_at = time.time()
-            success_info = self._detect_success_result(rect)
+            success_info = self._detect_fast_success_result(rect, fast_only=False)
             if success_info and success_info.get("location"):
                 self._finish_success_result(rect, success_info, attempt=attempt + 1, max_attempts=max_attempts)
                 return
-            failed_info = self._detect_failed_result(rect)
+
+            failed_info = self._detect_fast_failed_result(rect)
             if self._maybe_finish_failed_result(rect, failed_info):
                 return
-            self._result_full_check_last = full_checked_at
+
+            now = time.time()
+            if attempt == 0 or now - getattr(self, "_result_full_check_last", 0) >= full_interval:
+                full_checked_at = time.time()
+                success_info = self._detect_success_result(rect)
+                if success_info and success_info.get("location"):
+                    self._finish_success_result(rect, success_info, attempt=attempt + 1, max_attempts=max_attempts)
+                    return
+                failed_info = self._detect_failed_result(rect)
+                if self._maybe_finish_failed_result(rect, failed_info):
+                    return
+                self._result_full_check_last = full_checked_at
+
+            if getattr(self, "_round_had_fishing_bar", False) and (attempt >= 1 or time.time() - result_start >= 0.75):
+                if self._try_finish_success_by_settlement_probe(rect, source_label="结算"):
+                    return
 
             ready_info = self._detect_ready_to_cast(rect, allow_heavy=False, require_initial_controls=True)
             if ready_info and ready_info.get("location"):
@@ -2884,6 +3047,8 @@ class StateMachine:
             # 如果既没有 F 键，也没有底部文字，说明可能还在播放动画，稍微等一下继续循环
             if not self._sleep_interruptible(0.25):
                 return
+            if time.time() - result_start >= result_timeout:
+                break
 
         # 如果试了多次还是不行，就强行重置，避免脚本卡死在这个状态
         self._log("[警告] 结算超时，强制返回待机状态。")
