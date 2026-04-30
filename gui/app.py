@@ -1389,6 +1389,7 @@ class FloatingControlWindow(QFrame):
         self._pending_hook_update = False
         self._user_visible_requested = False
         self._temporarily_hidden_by_game = False
+        self._hidden_for_capture = False
         self._collapsed = False
         self._active_page_index = 0
         self._last_log_version = -1
@@ -1725,6 +1726,10 @@ class FloatingControlWindow(QFrame):
     def sync_game_visibility(self):
         if not self._user_visible_requested:
             return
+        if self._hidden_for_capture:
+            if self.isVisible():
+                self.hide()
+            return
 
         rect = self._current_game_rect(allow_find=True)
         if rect is None:
@@ -1747,6 +1752,23 @@ class FloatingControlWindow(QFrame):
             if hasattr(self.app_window, "_sync_user_takeover_exclude_rects"):
                 self.app_window._sync_user_takeover_exclude_rects()
         self._update_toggle_button()
+
+    def set_capture_hidden(self, hidden):
+        hidden = bool(hidden)
+        if self._hidden_for_capture == hidden:
+            return
+        self._hidden_for_capture = hidden
+        if hidden:
+            self._last_target_pos = None
+            self._release_event_hook()
+            if self.isVisible():
+                self.hide()
+        elif self._user_visible_requested:
+            if not self.visibility_timer.isActive():
+                self.visibility_timer.start()
+            self.sync_game_visibility()
+        if hasattr(self.app_window, "_sync_user_takeover_exclude_rects"):
+            self.app_window._sync_user_takeover_exclude_rects()
 
     def _current_game_rect(self, allow_find=False):
         wm = self.app_window.sm.wm
@@ -2259,11 +2281,13 @@ class AppWindow(QMainWindow):
             "user_takeover_protection": True,
             "user_takeover_mouse_threshold": 12,
             "user_takeover_start_grace": 1.20,
+            "auto_buy_bait_amount": 0,
             "update_startup_jitter_seconds": 20,
             "update_check_interval_minutes": 30,
             "log_line_limit": 320,
             "auto_switch_to_log": True,
             "debug_mode": False,
+            "bait_shop_debug_mode": False,
         }
         self.config = dict(self.default_config)
         self.load_config()
@@ -2275,6 +2299,10 @@ class AppWindow(QMainWindow):
         self.sm = StateMachine(log_queue=self.log_queue, debug_queue=self.debug_queue)
         self._agreement_shown = False
         self.floating_window = None
+        self._main_hidden_for_capture = False
+        self._main_capture_was_visible = False
+        self._main_capture_geometry = None
+        self._main_capture_window_state = None
         self.modules_ready = False
         self.modules_initializing = False
         self.init_animation_step = 0
@@ -2417,7 +2445,9 @@ class AppWindow(QMainWindow):
         self.sm.update_config("user_takeover_protection", self.config.get("user_takeover_protection", True))
         self.sm.update_config("user_takeover_mouse_threshold", self.config.get("user_takeover_mouse_threshold", 12))
         self.sm.update_config("user_takeover_start_grace", self.config.get("user_takeover_start_grace", 1.20))
+        self.sm.update_config("auto_buy_bait_amount", self.config.get("auto_buy_bait_amount", 0))
         self.sm.update_config("debug_mode", self.config.get("debug_mode", False))
+        self.sm.update_config("bait_shop_debug_mode", self.config.get("bait_shop_debug_mode", False))
 
     def _refresh_debug_view_state(self):
         if not hasattr(self, "debug_preview"):
@@ -2801,7 +2831,7 @@ class AppWindow(QMainWindow):
         self.init_animation_step = 0
         self.init_animation_timer.start(360)
         self.update_primary_buttons()
-        self.write_log("[系统] 开始初始化鱼名与重量 OCR 识别模块...")
+        self.write_log("[系统] 开始初始化鱼名、重量与界面文字 OCR 识别模块...")
         self.show_toast("正在初始化识别模块", "info")
 
         self.ocr_init_worker = RecognitionInitWorker(self.sm, self)
@@ -3390,6 +3420,24 @@ class AppWindow(QMainWindow):
         timing_layout.addStretch()
         self._add_settings_category("流程与超时", timing_page, timing_keys)
 
+        bait_page, bait_layout = self._build_settings_category_page(
+            "鱼饵补给",
+            "仅在开始钓鱼后检测到鱼饵不足提示时触发，自动进入商店购买无上限万能鱼饵。",
+        )
+        bait_keys = []
+        self.slider_auto_buy_bait_amount = self._bait_purchase_settings_block(bait_layout)
+        bait_keys.append("auto_buy_bait_amount")
+        self.bait_shop_debug_button = self._settings_toggle_block(
+            bait_layout,
+            "鱼饵商店候选调试",
+            "开启后，自动购买鱼饵定位失败时会在程序目录保存候选框截图和明细文本，用于排查商品卡片、货币图标和名称识别问题。",
+            self.config.get("bait_shop_debug_mode", False),
+            "bait_shop_debug_mode",
+        )
+        bait_keys.append("bait_shop_debug_mode")
+        bait_layout.addStretch()
+        self._add_settings_category("鱼饵补给", bait_page, bait_keys)
+
         recognition_page, recognition_layout = self._build_settings_category_page(
             "识别与判定",
             "控制耐力条置信度和结算/失败检测频率。数值越激进，响应越快；数值越保守，误判风险越低。",
@@ -3765,6 +3813,109 @@ class AppWindow(QMainWindow):
         self.config[key] = self._config_from_slider_value(slider_value, value_scale, config_decimals)
         return slider
 
+    def _bait_purchase_settings_block(self, parent_layout):
+        key = "auto_buy_bait_amount"
+        block = self._settings_panel()
+        layout = QVBoxLayout(block)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        title_label = QLabel("鱼饵不足自动购买")
+        title_label.setStyleSheet(f"background: transparent; border: none; color: {APP_COLORS['text']}; font-size: 16px; font-weight: 800;")
+        top.addWidget(title_label)
+        top.addStretch()
+
+        raw_amount = self.config.get(key, 0)
+        try:
+            slider_value = int(float(raw_amount) // 99)
+        except (TypeError, ValueError):
+            slider_value = 0
+        slider_value = max(0, min(101, slider_value))
+
+        value_label = QLabel()
+        value_label.setStyleSheet(
+            f"""
+            QLabel {{
+                color: {APP_COLORS['accent_soft']};
+                background-color: rgba(29, 208, 214, 0.10);
+                border: 1px solid rgba(29, 208, 214, 0.22);
+                border-radius: 14px;
+                padding: 6px 10px;
+                font-size: 18px;
+                font-weight: 900;
+            }}
+            """
+        )
+        value_label.setMinimumWidth(96)
+        value_label.setAlignment(Qt.AlignCenter)
+        top.addWidget(value_label)
+        layout.addLayout(top)
+
+        note_label = QLabel("设置为 0 时关闭自动购买。开启后每次购买 99 个万能鱼饵，单个鱼饵按 5 鱼鳞币计算。")
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet(f"background: transparent; border: none; color: {APP_COLORS['text_dim']}; font-size: 12px;")
+        layout.addWidget(note_label)
+
+        cost_label = QLabel()
+        cost_label.setWordWrap(True)
+        cost_label.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['warning']}; font-size: 12px; font-weight: 800;"
+        )
+        layout.addWidget(cost_label)
+
+        slider = NoWheelSlider(Qt.Horizontal)
+        slider.setRange(0, 101)
+        slider.setValue(slider_value)
+        slider.setFocusPolicy(Qt.NoFocus)
+        slider.setStyleSheet(
+            f"""
+            QSlider::groove:horizontal {{
+                background-color: rgba(255, 255, 255, 0.08);
+                border-radius: 5px;
+                height: 10px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background-color: rgba(29, 208, 214, 0.82);
+                border-radius: 5px;
+                height: 10px;
+            }}
+            QSlider::handle:horizontal {{
+                background-color: #B8FFFF;
+                border: 2px solid rgba(29, 208, 214, 0.92);
+                width: 16px;
+                margin: -4px 0;
+                border-radius: 8px;
+            }}
+            """
+        )
+
+        def update_bait_amount(new_value):
+            amount = int(new_value) * 99
+            cost = amount * 5
+            self.config[key] = amount
+            value_label.setText("关闭" if amount <= 0 else f"{amount}个")
+            if amount <= 0:
+                cost_label.setText("自动购买已关闭；鱼饵不足时会停止自动钓鱼，避免重复空转。")
+            else:
+                cost_label.setText(f"当前设置会购买 {amount} 个万能鱼饵，需要准备 {cost} 鱼鳞币；鱼鳞币不足时购买流程会停止。")
+            self._mark_settings_dirty()
+
+        slider.valueChanged.connect(update_bait_amount)
+        update_bait_amount(slider_value)
+        layout.addWidget(slider)
+        parent_layout.addWidget(block)
+        self._setting_widgets[key] = {
+            "type": "slider",
+            "widget": slider,
+            "value_scale": 99,
+            "display_scale": 99,
+            "display_suffix": "个",
+            "display_decimals": 0,
+            "config_decimals": None,
+        }
+        return slider
+
     def _settings_toggle_block(self, parent_layout, title, note, checked, key):
         block = self._settings_panel()
         layout = QHBoxLayout(block)
@@ -3963,6 +4114,18 @@ class AppWindow(QMainWindow):
         if msg == "CMD_STOP_UPDATE_GUI":
             self.update_ui_on_stop()
             return
+        if msg == "CMD_MAIN_HIDE_FOR_CAPTURE":
+            self._set_main_capture_hidden(True)
+            return
+        if msg == "CMD_MAIN_RESTORE_AFTER_CAPTURE":
+            self._set_main_capture_hidden(False)
+            return
+        if msg == "CMD_FLOATING_HIDE_FOR_CAPTURE":
+            self._set_floating_capture_hidden(True)
+            return
+        if msg == "CMD_FLOATING_RESTORE_AFTER_CAPTURE":
+            self._set_floating_capture_hidden(False)
+            return
         if isinstance(msg, str) and msg.startswith("CMD_USER_TAKEOVER_PAUSED"):
             reason = ""
             if "::" in msg:
@@ -3981,6 +4144,45 @@ class AppWindow(QMainWindow):
             self.log_textbox.verticalScrollBar().setValue(self.log_textbox.verticalScrollBar().maximum())
         if self.floating_window is not None:
             self.floating_window.refresh_log_view()
+
+    def _set_floating_capture_hidden(self, hidden):
+        floating = getattr(self, "floating_window", None)
+        if floating is None:
+            return
+        floating.set_capture_hidden(hidden)
+
+    def _set_main_capture_hidden(self, hidden):
+        hidden = bool(hidden)
+        if hidden:
+            if getattr(self, "_main_hidden_for_capture", False):
+                return
+            self._main_hidden_for_capture = True
+            self._main_capture_was_visible = bool(self.isVisible())
+            self._main_capture_geometry = self.geometry()
+            self._main_capture_window_state = self.windowState()
+            if self._main_capture_was_visible:
+                if self.isMaximized() or self.isFullScreen():
+                    self.showNormal()
+                self.move(-32000, -32000)
+            return
+
+        if not getattr(self, "_main_hidden_for_capture", False):
+            return
+        was_visible = bool(getattr(self, "_main_capture_was_visible", False))
+        geometry = getattr(self, "_main_capture_geometry", None)
+        window_state = getattr(self, "_main_capture_window_state", None)
+        self._main_hidden_for_capture = False
+        self._main_capture_was_visible = False
+        self._main_capture_geometry = None
+        self._main_capture_window_state = None
+        if was_visible:
+            if geometry is not None:
+                self.setGeometry(geometry)
+            if window_state is not None:
+                self.setWindowState(window_state)
+            if not self.isVisible():
+                self.show()
+            self.raise_()
 
     def process_queue(self):
         self._sync_user_takeover_exclude_rects()

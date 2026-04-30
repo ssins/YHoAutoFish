@@ -268,6 +268,108 @@ class VisionCore:
             return best_loc, best_conf, best_path
         return None, best_conf, best_path
 
+    def find_template_matches(
+        self,
+        screen_img,
+        template_path,
+        threshold=0.75,
+        max_matches=12,
+        min_distance=24,
+        **kwargs,
+    ):
+        matches = []
+        if screen_img is None or not template_path:
+            return matches
+
+        use_edge = bool(kwargs.get("use_edge", False))
+        use_binary = bool(kwargs.get("use_binary", False))
+        binary_threshold = int(kwargs.get("binary_threshold", 200))
+        scale_range = kwargs.get("scale_range")
+        scale_steps = kwargs.get("scale_steps", 7)
+        use_mask = bool(kwargs.get("use_mask", False))
+        mask_threshold = int(kwargs.get("mask_threshold", 8))
+
+        try:
+            screen_gray = self._prepare_for_match(
+                screen_img,
+                use_edge=use_edge,
+                use_binary=use_binary,
+                binary_threshold=binary_threshold,
+            )
+            template_gray = self._template_for_match(
+                template_path,
+                use_edge=use_edge,
+                use_binary=use_binary,
+                binary_threshold=binary_threshold,
+            )
+            if screen_gray is None or template_gray is None:
+                return matches
+
+            template_mask = None
+            if use_mask:
+                template_mask = self._template_mask_for_match(
+                    template_path,
+                    use_edge=use_edge,
+                    use_binary=use_binary,
+                    binary_threshold=binary_threshold,
+                    mask_threshold=mask_threshold,
+                )
+
+            max_matches = max(1, int(max_matches))
+            min_distance = max(1, int(min_distance))
+            for scale in self._build_scales(scale_range=scale_range, scale_steps=scale_steps):
+                width = int(round(template_gray.shape[1] * scale))
+                height = int(round(template_gray.shape[0] * scale))
+                if width < 4 or height < 4 or width > screen_gray.shape[1] or height > screen_gray.shape[0]:
+                    continue
+
+                interpolation = cv2.INTER_NEAREST if use_binary else (cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
+                resized_template = cv2.resize(template_gray, (width, height), interpolation=interpolation)
+                if float(np.std(resized_template)) < 1.0:
+                    continue
+
+                resized_mask = None
+                match_method = cv2.TM_CCOEFF_NORMED
+                if template_mask is not None:
+                    resized_mask = cv2.resize(template_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+                    _, resized_mask = cv2.threshold(resized_mask, 1, 255, cv2.THRESH_BINARY)
+                    if cv2.countNonZero(resized_mask) >= 5:
+                        match_method = cv2.TM_CCORR_NORMED
+                    else:
+                        resized_mask = None
+
+                if resized_mask is not None:
+                    res = cv2.matchTemplate(screen_gray, resized_template, match_method, mask=resized_mask)
+                else:
+                    res = cv2.matchTemplate(screen_gray, resized_template, match_method)
+                res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+
+                while len(matches) < max_matches:
+                    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                    max_val = max(-1.0, min(1.0, float(max_val)))
+                    if max_val < threshold:
+                        break
+                    center = (max_loc[0] + width // 2, max_loc[1] + height // 2)
+                    if all((center[0] - item["location"][0]) ** 2 + (center[1] - item["location"][1]) ** 2 >= min_distance ** 2 for item in matches):
+                        matches.append({
+                            "location": center,
+                            "confidence": max_val,
+                            "template": template_path,
+                            "scale": scale,
+                            "size": (width, height),
+                        })
+                    x1 = max(0, max_loc[0] - min_distance)
+                    y1 = max(0, max_loc[1] - min_distance)
+                    x2 = min(res.shape[1], max_loc[0] + width + min_distance)
+                    y2 = min(res.shape[0], max_loc[1] + height + min_distance)
+                    res[y1:y2, x1:x2] = -1.0
+
+            matches.sort(key=lambda item: item["confidence"], reverse=True)
+            return matches[:max_matches]
+        except Exception as e:
+            print(f"[Vision] Template multi-match error: {e}")
+            return []
+
     def find_best_template_multi_strategy(self, screen_img, template_paths, strategies, threshold=0.75, **base_kwargs):
         """使用多种预处理策略匹配模板，返回最可靠的命中。"""
         best_raw = (None, -1.0, None, "")

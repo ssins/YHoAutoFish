@@ -1,3 +1,4 @@
+import ctypes
 import time
 import pydirectinput  # 引入更成熟的底层模拟库
 
@@ -44,6 +45,25 @@ class Controller:
             self.key_up(key_char)
         except Exception:
             pass
+
+    def mouse_click(self, x, y, duration=0.05):
+        """移动到屏幕坐标后执行一次左键点击。"""
+        try:
+            x = int(round(x))
+            y = int(round(y))
+            try:
+                ctypes.windll.user32.SetCursorPos(x, y)
+            except Exception:
+                pass
+            time.sleep(0.02)
+            pydirectinput.mouseDown(x=x, y=y, button="left")
+            if duration > 0:
+                time.sleep(duration)
+            pydirectinput.mouseUp(x=x, y=y, button="left")
+            return True
+        except Exception as e:
+            print(f"[Controller] MouseClick error: {e}")
+            return False
         
     def release_all(self):
         """释放所有记录在案的被按下的键 (安全保护)"""

@@ -15,6 +15,8 @@ class UserActivityMonitor:
         "f": 0x46,
         "esc": 0x1B,
         "escape": 0x1B,
+        "mouse_left": 0x01,
+        "left_mouse": 0x01,
     }
 
     KEY_NAMES = {
